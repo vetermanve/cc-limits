@@ -30,7 +30,7 @@ One-shot:
 In the Claude Code status line, refreshed every turn:
 
 ```
-> my-project  git:(main)  5ч 24% -61% 1ч 54м | 7д 19% -76% 1д 12ч 54м
+> my-project  git:(main)  5ч 24% -61% 1ч 54м | 7д 19% -76% 1д 12ч 54м | 19:05
 ```
 
 Reading a row:
@@ -152,6 +152,12 @@ If you do not have a status line yet, point Claude Code at it:
 
 `--statusline` never blocks on the network: it prints whatever is in the cache
 and kicks off the refresh in the background. Measured cost is about 60 ms.
+
+The last segment is the clock time of that cached reading. The cache lives up
+to two minutes, longer while the endpoint is rate limiting, so without the
+stamp there is no way to tell how old the numbers on screen are. It greys along
+with the rest until the data passes five minutes, then turns yellow, then red
+past fifteen.
 
 ## How it works
 

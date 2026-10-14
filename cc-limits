@@ -171,6 +171,18 @@ def fmt_dev(dev: float) -> str:
     return "0%" if r == 0 else f"{r:+d}%"
 
 
+def age_color(age: float) -> str:
+    """
+    Возраст данных. Решать, сколько ещё работать, по устаревшим цифрам лимита
+    опаснее всего, поэтому после пяти минут жёлтый, после пятнадцати красный.
+    """
+    if age > 900:
+        return C_RED
+    if age > 300:
+        return C_YELLOW
+    return C_DIM
+
+
 def risk_color(pct: float, dev, running_out: bool) -> str:
     """
     Цвет расхода по риску, а не по абсолютному уровню. Голый процент о риске
@@ -562,9 +574,7 @@ def render(data: dict, age: float, err: str, width: int = 34) -> str:
     head = paint("Лимиты Claude Code", C_CYAN + C_BOLD, on)
     agetxt = ""
     if age is not None and age > 5:
-        # на старых данных решение о расходе принимать опасно - подсвечиваем
-        ac = C_RED if age > 900 else (C_YELLOW if age > 300 else C_DIM)
-        agetxt = "  " + paint(f"(данным {fmt_dur(age)})", ac, on)
+        agetxt = "  " + paint(f"(данным {fmt_dur(age)})", age_color(age), on)
     out.append(f"{head}  {paint(stamp, C_DIM, on)}{agetxt}")
     note = reserve_note()
     if note:
@@ -634,7 +644,7 @@ def reserve_note() -> str:
     return "проценты от бюджета, " + ", ".join(parts) if parts else ""
 
 
-def render_statusline(data: dict, err: str) -> str:
+def render_statusline(data: dict, err: str, age: float = None) -> str:
     on = color_enabled()
     if data is None:
         return paint("лимиты: n/a", C_DIM, on)
@@ -661,6 +671,13 @@ def render_statusline(data: dict, err: str) -> str:
         mark = "*" if reserves()["seven_day"] > 0 else ""
         bits.append(paint(f"7д{mark} {d7:.0f}%", risk_color(d7, dev, False), on)
                     + eq + paint(t, C_DIM, on))
+
+    # время последнего обновления: кэш живёт до двух минут, а при 429 и дольше,
+    # и без отметки непонятно, насколько устаревшие цифры перед глазами
+    if bits and age is not None:
+        stamp = datetime.fromtimestamp(time.time() - age).strftime("%H:%M")
+        bits.append(paint(stamp, age_color(age), on))
+
     return paint(" | ", C_DIM, on).join(bits) if bits else ""
 
 
@@ -686,11 +703,11 @@ def mode_statusline() -> int:
         stale, stale_age = load_cache(max_age=None)
         if stale is None:
             return 0  # ещё нет данных - молчим, не мусорим в statusline
-        print(render_statusline(stale, None), end="")
+        print(render_statusline(stale, None, stale_age), end="")
         return 0
     if age is not None and age > CACHE_TTL * 0.6:
         spawn_background_refresh()
-    print(render_statusline(cached, None), end="")
+    print(render_statusline(cached, None, age), end="")
     return 0
 
 
