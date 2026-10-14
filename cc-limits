@@ -66,7 +66,6 @@ WINDOW_7D = 7 * 24 * 3600
 C_RESET = "\033[0m"
 C_DIM = "\033[2m"
 C_BOLD = "\033[1m"
-C_GREEN = "\033[32m"
 C_YELLOW = "\033[33m"
 C_RED = "\033[31m"
 C_CYAN = "\033[36m"
@@ -147,16 +146,18 @@ def color_enabled() -> bool:
 
 
 def paint(text: str, color: str, on: bool) -> str:
-    return f"{color}{text}{C_RESET}" if on else text
+    """Пустой color означает "не красить" - цвет берётся только у сигналов."""
+    return f"{color}{text}{C_RESET}" if on and color else text
 
 
 def dev_color(dev: float) -> str:
     """
-    Отклонение от равномерного темпа: ноль или запас - зелёный,
-    перерасход - жёлтый. Решение по округлённому значению, чтобы цвет не
-    противоречил выведенной цифре (иначе +0.4% рисуется как "0%", но жёлтым).
+    Цветом помечается только то, с чем надо что-то делать: перерасход
+    относительно равномерного темпа. Ноль и запас остаются нейтральными,
+    предупреждать там не о чем. Решение по округлённому значению, чтобы цвет
+    не противоречил выведенной цифре (иначе +0.4% рисуется как "0%", жёлтым).
     """
-    return C_GREEN if round(dev) <= 0 else C_YELLOW
+    return C_YELLOW if round(dev) > 0 else ""
 
 
 def fmt_dev(dev: float) -> str:
@@ -170,12 +171,10 @@ def fmt_dev(dev: float) -> str:
     return "0%" if r == 0 else f"{r:+d}%"
 
 
-def level_color(pct: float) -> str:
-    if pct >= 85:
-        return C_RED
-    if pct >= 60:
-        return C_YELLOW
-    return C_GREEN
+# Абсолютный процент расхода цветом не помечается. Сам по себе он не говорит
+# о риске: 60% за десять минут до сброса - это запас, а не повод для тревоги.
+# О риске говорят отклонение от равномерного темпа и прогноз исчерпания, они
+# цвет и несут.
 
 
 # --- получение данных --------------------------------------------------------
@@ -492,8 +491,7 @@ def bar(pct: float, width: int, on: bool) -> str:
     if pct is None:
         return paint("-" * width, C_DIM, on)
     filled = int(round(min(100.0, max(0.0, pct)) / 100 * width))
-    c = level_color(pct)
-    return paint("#" * filled, c, on) + paint("." * (width - filled), C_DIM, on)
+    return "#" * filled + paint("." * (width - filled), C_DIM, on)
 
 
 def render_line(label: str, data: dict, key: str, window: float,
@@ -506,11 +504,10 @@ def render_line(label: str, data: dict, key: str, window: float,
     if pct is None:
         return f" {label:<4} " + paint("нет данных", C_DIM, on)
 
-    c = level_color(pct)
     parts = [
         f" {label:<4}",
         "[" + bar(pct, width, on) + "]",
-        paint(f"{pct:5.1f}%", c + C_BOLD, on),
+        paint(f"{pct:5.1f}%", C_BOLD, on),
     ]
     # при резерве показываем и сырой процент окна, чтобы пересчёт был виден
     if reserve > 0:
@@ -536,7 +533,7 @@ def render_line(label: str, data: dict, key: str, window: float,
             parts.append(paint(f"КОНЕЦ через {fmt_dur(eta)} ({rate:.1f}%/ч)",
                                C_RED + C_BOLD, on))
         else:
-            parts.append(paint(f"хватит до сброса ({rate:.1f}%/ч)", C_GREEN, on))
+            parts.append(paint(f"хватит до сброса ({rate:.1f}%/ч)", "", on))
     else:
         parts.append(paint("расход ~0", C_DIM, on))
 
@@ -589,9 +586,8 @@ def render(data: dict, age: float, err: str, width: int = 34) -> str:
                           if s.get("limit_index") == (data["limits"].index(lim))), None)
             allow = share.get("allowance_percent_of_weekly") if share else None
             tail = f" (квота {allow}% недели)" if allow is not None else ""
-            on_c = level_color(p or 0)
             out.append(f" {model:<4}  [" + bar(p, width, on) + "]  "
-                       + paint(f"{p:5.1f}%", on_c, on) + paint(tail, C_DIM, on))
+                       + f"{p:5.1f}%" + paint(tail, C_DIM, on))
 
     # на что ушла неделя
     bd = data.get("seven_day_breakdown") or {}
@@ -639,15 +635,14 @@ def render_statusline(data: dict, err: str) -> str:
         if dev is not None:
             eq = " " + paint(fmt_dev(dev), dev_color(dev), on)
         mark = "*" if reserves()["five_hour"] > 0 else ""
-        bits.append(paint(f"5ч{mark} {h5:.0f}%", level_color(h5), on) + eq
-                    + paint(t, C_DIM, on))
+        bits.append(f"5ч{mark} {h5:.0f}%" + eq + paint(t, C_DIM, on))
     if d7 is not None:
         dev, _ = pace_dev(d7, reset_of(data, "seven_day"), WINDOW_7D)
         eq = ""
         if dev is not None:
             eq = " " + paint(fmt_dev(dev), dev_color(dev), on)
         mark = "*" if reserves()["seven_day"] > 0 else ""
-        bits.append(paint(f"7д{mark} {d7:.0f}%", level_color(d7), on) + eq)
+        bits.append(f"7д{mark} {d7:.0f}%" + eq)
     return paint("|", C_DIM, on).join(bits) if bits else ""
 
 

@@ -37,10 +37,17 @@ Reading a row:
 
 | Field | Meaning |
 | --- | --- |
-| `24.0%` | utilization, green below 60, yellow 60-85, red above 85. Of the usable budget, which is the whole window unless you set a [reserve](#shared-account-reserving-part-of-a-window) |
+| `24.0%` | utilization of the usable budget, which is the whole window unless you set a [reserve](#shared-account-reserving-part-of-a-window) |
 | `сброс 1ч 54м` | time until the window resets |
-| `откл -61%` | deviation from an even burn of the window budget: `0%` is exactly on pace, `-61%` means you are 61% slower than even (you have slack), `+20%` means 20% faster (you will hit the wall before the reset). Green at or below zero, yellow above |
+| `откл -61%` | deviation from an even burn of the budget: `0%` is exactly on pace, `-61%` means you are 61% slower than even (you have slack), `+20%` means 20% faster. Yellow when positive |
 | `хватит до сброса (8.5%/ч)` | measured burn rate and whether it lasts until the reset. Turns into a red `КОНЕЦ через 1ч 30м` when the projection says you run out first |
+
+Only things worth acting on carry color: a positive deviation is yellow, a
+projection that runs out before the reset is red, and stale cached data is
+flagged by its age label. Everything else, the utilization figure included,
+stays neutral. A raw percentage says nothing about risk on its own: 60% ten
+minutes before the reset is slack, not a warning, and coloring it would
+contradict the deviation sitting right next to it.
 
 ## Shared account: reserving part of a window
 
