@@ -8,6 +8,12 @@ OAuth-токен берётся оттуда же, откуда его берё�
 $CLAUDE_CODE_OAUTH_TOKEN, macOS Keychain (service "Claude Code-credentials")
 или ~/.claude/.credentials.json.
 
+Если аккаунт общий и часть окна надо держать в резерве, резерв задаётся в
+$CLAUDE_CONFIG_DIR/cc-limits.json ({"reserve": {"five_hour": 20}}) или
+переменными CC_LIMITS_RESERVE_5H / CC_LIMITS_RESERVE_7D. Тогда все проценты,
+отклонение и прогноз считаются от оставшегося бюджета: при резерве 20%
+расход 80% окна показывается как 100%.
+
 Режимы:
   cc-limits                 одноразовый вывод (из кэша, если свежий)
   cc-limits --force         игнорировать кэш, запросить сервер
@@ -38,6 +44,7 @@ USER_AGENT = "claude-cli/2.1.273 (external, cli)"
 # Claude Code держит конфиг в $CLAUDE_CONFIG_DIR, иначе в ~/.claude
 CONFIG_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR") or (Path.home() / ".claude"))
 CREDENTIALS_FILE = CONFIG_DIR / ".credentials.json"
+CONFIG_FILE = CONFIG_DIR / "cc-limits.json"
 CACHE_DIR = CONFIG_DIR / "cache"
 CACHE_FILE = CACHE_DIR / "cc-limits-cache.json"
 HISTORY_FILE = CACHE_DIR / "cc-limits-history.jsonl"
@@ -47,6 +54,9 @@ CACHE_TTL = 120  # сек
 # которого запрос не делаем.
 MIN_WATCH_INTERVAL = 60.0
 THROTTLE_FILE = CACHE_DIR / "cc-limits-throttle"
+# backoff при 429: 60с, 120с, 240с ... но не дольше 15 минут
+BACKOFF_BASE = 60.0
+BACKOFF_MAX = 900.0
 HISTORY_MAX = 2000  # строк, дальше обрезаем
 
 # длины окон в секундах
@@ -60,6 +70,74 @@ C_GREEN = "\033[32m"
 C_YELLOW = "\033[33m"
 C_RED = "\033[31m"
 C_CYAN = "\033[36m"
+
+
+def load_reserves() -> dict:
+    """
+    Резерв - доля окна, которую нельзя тратить (например, аккаунт общий и
+    напарник просил всегда оставлять 20% пятичасового окна). Вся математика
+    считается от оставшегося бюджета: при резерве 20% расход 80% окна
+    показывается как 100%, выше - больше 100%.
+
+    Источники, последний побеждает:
+      $CLAUDE_CONFIG_DIR/cc-limits.json -> {"reserve": {"five_hour": 20}}
+      переменные CC_LIMITS_RESERVE_5H / CC_LIMITS_RESERVE_7D
+    По умолчанию резерва нет и показываются сырые проценты окна.
+    """
+    reserves = {"five_hour": 0.0, "seven_day": 0.0}
+
+    try:
+        raw = json.loads(CONFIG_FILE.read_text()).get("reserve") or {}
+    except FileNotFoundError:
+        raw = {}
+    except (OSError, json.JSONDecodeError, AttributeError) as e:
+        raise RuntimeError(f"не разобрал {CONFIG_FILE}: {e}")
+
+    for key in reserves:
+        if key in raw:
+            reserves[key] = parse_reserve(raw[key], f"{CONFIG_FILE}: reserve.{key}")
+
+    for key, env in (("five_hour", "CC_LIMITS_RESERVE_5H"),
+                     ("seven_day", "CC_LIMITS_RESERVE_7D")):
+        if os.environ.get(env):
+            reserves[key] = parse_reserve(os.environ[env], env)
+
+    return reserves
+
+
+def parse_reserve(value, where: str) -> float:
+    """Резерв вне [0, 100) оставил бы нулевой или отрицательный бюджет."""
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        raise RuntimeError(f"{where}: ожидал число, получил {value!r}")
+    if not 0 <= num < 100:
+        raise RuntimeError(f"{where}: резерв {num} вне диапазона 0..99")
+    return num
+
+
+_RESERVES = None
+
+
+def reserves() -> dict:
+    """Резервы окон, читаются один раз за запуск."""
+    global _RESERVES
+    if _RESERVES is None:
+        _RESERVES = load_reserves()
+    return _RESERVES
+
+
+def reserve_for(key: str) -> float:
+    """Резерв окна. Недельные лимиты по моделям живут в недельном резерве."""
+    r = reserves()
+    return r["five_hour"] if key == "five_hour" else r["seven_day"]
+
+
+def to_budget(pct: float, reserve: float):
+    """Сырой процент окна -> процент доступного бюджета."""
+    if pct is None:
+        return None
+    return pct / (100.0 - reserve) * 100.0
 
 
 def color_enabled() -> bool:
@@ -166,32 +244,64 @@ def fetch_usage() -> dict:
         if e.code == 401:
             raise RuntimeError("401: токен отвергнут, запусти claude для refresh")
         if e.code == 429:
-            wait = 300
-            try:
-                wait = max(1, int(e.headers.get("Retry-After") or wait))
-            except ValueError:
-                pass
-            set_throttle(time.time() + wait)
-            raise RuntimeError(f"429: сервер просит подождать {fmt_dur(wait)}")
+            wait = note_rate_limit(e.headers.get("Retry-After"))
+            raise RuntimeError(f"429: лимит запросов, пауза {fmt_dur(wait)}")
         raise RuntimeError(f"HTTP {e.code}: {body}")
     except urllib.error.URLError as e:
         raise RuntimeError(f"сеть недоступна: {e.reason}")
 
 
-def get_throttle() -> float:
-    """Момент времени, раньше которого запрос делать нельзя (0 если можно)."""
+def read_throttle() -> dict:
+    """{"until": момент, раньше которого не запрашиваем, "strikes": 429 подряд}"""
+    empty = {"until": 0.0, "strikes": 0}
     try:
-        return float(THROTTLE_FILE.read_text().strip())
-    except (OSError, ValueError):
-        return 0.0
+        d = json.loads(THROTTLE_FILE.read_text())
+    except (OSError, json.JSONDecodeError):
+        return empty
+    # до версии с backoff тут лежало голое число - валидный JSON, но не dict
+    if not isinstance(d, dict):
+        return empty
+    try:
+        return {"until": float(d.get("until") or 0),
+                "strikes": int(d.get("strikes") or 0)}
+    except (TypeError, ValueError):
+        return empty
 
 
-def set_throttle(until: float) -> None:
+def write_throttle(until: float, strikes: int) -> None:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     try:
-        THROTTLE_FILE.write_text(str(until))
+        THROTTLE_FILE.write_text(json.dumps({"until": until,
+                                             "strikes": strikes}))
     except OSError:
         pass
+
+
+def note_rate_limit(retry_after) -> float:
+    """
+    Регистрирует 429 и возвращает, сколько ждать.
+
+    Retry-After у этого эндпоинта ненадёжен: он присылает 0-1 секунду и
+    продолжает отказывать. Поэтому ждём максимум из его подсказки и
+    собственного backoff, который растёт с каждым 429 подряд. Иначе
+    получается цикл "подождал секунду - снова 429".
+    """
+    strikes = read_throttle()["strikes"] + 1
+    backoff = min(BACKOFF_BASE * 2 ** (strikes - 1), BACKOFF_MAX)
+    hint = 0.0
+    try:
+        hint = float(retry_after or 0)
+    except (TypeError, ValueError):
+        pass
+    wait = max(backoff, hint)
+    write_throttle(time.time() + wait, strikes)
+    return wait
+
+
+def clear_rate_limit() -> None:
+    """Успешный запрос обнуляет backoff."""
+    if read_throttle()["strikes"]:
+        write_throttle(0.0, 0)
 
 
 def load_cache(max_age: float = CACHE_TTL):
@@ -220,8 +330,9 @@ def append_history(data: dict) -> None:
     """Пишет точку замера для расчёта скорости расхода."""
     row = {
         "t": time.time(),
-        "h5": pct_of(data, "five_hour"),
-        "d7": pct_of(data, "seven_day"),
+        # сырые проценты: смена резерва не должна переписывать историю
+        "h5": raw_pct_of(data, "five_hour"),
+        "d7": raw_pct_of(data, "seven_day"),
         "h5_reset": reset_of(data, "five_hour"),
         "d7_reset": reset_of(data, "seven_day"),
     }
@@ -257,8 +368,8 @@ def get_data(force: bool = False) -> tuple:
         if cached is not None:
             return cached, age, None
 
-    # сервер ранее ответил 429 - ждём указанный им срок, отдаём кэш
-    wait_left = get_throttle() - time.time()
+    # сервер ранее ответил 429 - выдерживаем паузу, отдаём кэш
+    wait_left = read_throttle()["until"] - time.time()
     if wait_left > 0:
         stale, age = load_cache(max_age=None)
         return stale, age, f"лимит запросов, повтор через {fmt_dur(wait_left)}"
@@ -268,6 +379,7 @@ def get_data(force: bool = False) -> tuple:
     except RuntimeError as e:
         stale, age = load_cache(max_age=None)
         return stale, age, str(e)
+    clear_rate_limit()
     save_cache(data)
     append_history(data)
     return data, 0.0, None
@@ -276,11 +388,17 @@ def get_data(force: bool = False) -> tuple:
 # --- разбор ------------------------------------------------------------------
 
 
-def pct_of(data: dict, key: str):
+def raw_pct_of(data: dict, key: str):
+    """Процент окна как его отдал сервер, без поправки на резерв."""
     node = (data or {}).get(key)
     if not node:
         return None
     return node.get("utilization")
+
+
+def pct_of(data: dict, key: str):
+    """Процент доступного бюджета: сырое значение с поправкой на резерв."""
+    return to_budget(raw_pct_of(data, key), reserve_for(key))
 
 
 def reset_of(data: dict, key: str):
@@ -311,7 +429,7 @@ def fmt_dur(sec: float) -> str:
 
 
 def burn_rate(rows: list, field: str, reset_field: str, reset_ts: float,
-              lookback: float, min_span: float):
+              lookback: float, min_span: float, reserve: float = 0.0):
     """
     Скорость расхода в %/час по замерам внутри текущего окна.
     min_span - минимальный интервал между первым и последним замером, сек.
@@ -336,7 +454,8 @@ def burn_rate(rows: list, field: str, reset_field: str, reset_ts: float,
     if span < min_span:
         return None, len(pts)
     dt = span / 3600.0
-    dp = pts[-1][field] - pts[0][field]
+    # история сырая, скорость приводим к бюджету тем же множителем
+    dp = to_budget(pts[-1][field] - pts[0][field], reserve)
     return dp / dt, len(pts)
 
 
@@ -380,7 +499,9 @@ def bar(pct: float, width: int, on: bool) -> str:
 def render_line(label: str, data: dict, key: str, window: float,
                 rows: list, hist_field: str, hist_reset: str,
                 lookback: float, min_span: float, width: int, on: bool) -> str:
-    pct = pct_of(data, key)
+    reserve = reserve_for(key)
+    raw = raw_pct_of(data, key)
+    pct = to_budget(raw, reserve)
     reset_ts = reset_of(data, key)
     if pct is None:
         return f" {label:<4} " + paint("нет данных", C_DIM, on)
@@ -391,6 +512,9 @@ def render_line(label: str, data: dict, key: str, window: float,
         "[" + bar(pct, width, on) + "]",
         paint(f"{pct:5.1f}%", c + C_BOLD, on),
     ]
+    # при резерве показываем и сырой процент окна, чтобы пересчёт был виден
+    if reserve > 0:
+        parts.append(paint(f"({raw:.0f}% окна)", C_DIM, on))
 
     if reset_ts is not None:
         parts.append(paint(f"сброс {fmt_dur(reset_ts - time.time())}", C_DIM, on))
@@ -401,7 +525,8 @@ def render_line(label: str, data: dict, key: str, window: float,
     elif expected is not None:
         parts.append(paint("откл: окно только началось", C_DIM, on))
 
-    rate, n = burn_rate(rows, hist_field, hist_reset, reset_ts, lookback, min_span)
+    rate, n = burn_rate(rows, hist_field, hist_reset, reset_ts, lookback,
+                        min_span, reserve)
     if rate is None:
         parts.append(paint(f"прогноз: мало замеров ({n})", C_DIM, on))
     elif rate > 0.05:
@@ -427,8 +552,13 @@ def render(data: dict, age: float, err: str, width: int = 34) -> str:
     head = paint("Лимиты Claude Code", C_CYAN + C_BOLD, on)
     agetxt = ""
     if age is not None and age > 5:
-        agetxt = paint(f"  (данным {int(age)} сек)", C_DIM, on)
+        # на старых данных решение о расходе принимать опасно - подсвечиваем
+        ac = C_RED if age > 900 else (C_YELLOW if age > 300 else C_DIM)
+        agetxt = "  " + paint(f"(данным {fmt_dur(age)})", ac, on)
     out.append(f"{head}  {paint(stamp, C_DIM, on)}{agetxt}")
+    note = reserve_note()
+    if note:
+        out.append(" " + paint(note, C_DIM, on))
     out.append("")
 
     if data is None:
@@ -454,7 +584,7 @@ def render(data: dict, age: float, err: str, width: int = 34) -> str:
         scope = lim.get("scope") or {}
         model = (scope.get("model") or {}).get("display_name")
         if lim.get("kind") == "weekly_scoped" and model:
-            p = lim.get("percent")
+            p = to_budget(lim.get("percent"), reserves()["seven_day"])
             share = next((s for s in data.get("weekly_scoped_shares") or []
                           if s.get("limit_index") == (data["limits"].index(lim))), None)
             allow = share.get("allowance_percent_of_weekly") if share else None
@@ -484,6 +614,16 @@ def render(data: dict, age: float, err: str, width: int = 34) -> str:
     return "\n".join(out)
 
 
+def reserve_note() -> str:
+    """Строка-пояснение: от какого бюджета считаются проценты."""
+    parts = []
+    for key, label in (("five_hour", "5ч"), ("seven_day", "7д")):
+        r = reserves()[key]
+        if r > 0:
+            parts.append(f"{label}: 100% = {100 - r:.0f}% окна (резерв {r:.0f}%)")
+    return "проценты от бюджета, " + ", ".join(parts) if parts else ""
+
+
 def render_statusline(data: dict, err: str) -> str:
     on = color_enabled()
     if data is None:
@@ -498,14 +638,16 @@ def render_statusline(data: dict, err: str) -> str:
         eq = ""
         if dev is not None:
             eq = " " + paint(fmt_dev(dev), dev_color(dev), on)
-        bits.append(paint(f"5ч {h5:.0f}%", level_color(h5), on) + eq
+        mark = "*" if reserves()["five_hour"] > 0 else ""
+        bits.append(paint(f"5ч{mark} {h5:.0f}%", level_color(h5), on) + eq
                     + paint(t, C_DIM, on))
     if d7 is not None:
         dev, _ = pace_dev(d7, reset_of(data, "seven_day"), WINDOW_7D)
         eq = ""
         if dev is not None:
             eq = " " + paint(fmt_dev(dev), dev_color(dev), on)
-        bits.append(paint(f"7д {d7:.0f}%", level_color(d7), on) + eq)
+        mark = "*" if reserves()["seven_day"] > 0 else ""
+        bits.append(paint(f"7д{mark} {d7:.0f}%", level_color(d7), on) + eq)
     return paint("|", C_DIM, on).join(bits) if bits else ""
 
 
@@ -564,6 +706,19 @@ def main() -> int:
     if "--help" in args or "-h" in args:
         print(__doc__)
         return 0
+
+    # конфиг резерва читаем до всего остального: если он битый, молча считать
+    # от неправильного бюджета нельзя
+    try:
+        reserves()
+    except RuntimeError as e:
+        if "--statusline" in args:
+            # в статуслайн трейсбек не лезет, но и пропадать молча индикатор
+            # не должен
+            print(paint("лимиты: битый конфиг", C_RED, color_enabled()), end="")
+            return 1
+        print(f"ошибка конфигурации: {e}", file=sys.stderr)
+        return 1
 
     if "--refresh" in args:
         data, _, err = get_data(force=True)

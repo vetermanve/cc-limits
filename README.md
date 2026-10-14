@@ -37,10 +37,50 @@ Reading a row:
 
 | Field | Meaning |
 | --- | --- |
-| `24.0%` | window utilization, green below 60, yellow 60-85, red above 85 |
+| `24.0%` | utilization, green below 60, yellow 60-85, red above 85. Of the usable budget, which is the whole window unless you set a [reserve](#shared-account-reserving-part-of-a-window) |
 | `сброс 1ч 54м` | time until the window resets |
 | `откл -61%` | deviation from an even burn of the window budget: `0%` is exactly on pace, `-61%` means you are 61% slower than even (you have slack), `+20%` means 20% faster (you will hit the wall before the reset). Green at or below zero, yellow above |
 | `хватит до сброса (8.5%/ч)` | measured burn rate and whether it lasts until the reset. Turns into a red `КОНЕЦ через 1ч 30м` when the projection says you run out first |
+
+## Shared account: reserving part of a window
+
+If the account is shared and you have to leave part of a window for someone
+else, declare that share as a reserve. Everything then counts against the
+budget that is actually yours: with a 20% reserve on the 5-hour window, burning
+80% of the window reads as `100.0%`, and anything beyond that reads above 100.
+
+`$CLAUDE_CONFIG_DIR/cc-limits.json` (default `~/.claude/cc-limits.json`):
+
+```json
+{
+  "reserve": {
+    "five_hour": 20,
+    "seven_day": 0
+  }
+}
+```
+
+Or per invocation: `CC_LIMITS_RESERVE_5H=20`, `CC_LIMITS_RESERVE_7D=0`. The
+environment wins over the file. Default is no reserve, in which case the
+numbers are the raw window percentages.
+
+```
+Лимиты Claude Code  19:25:20
+ проценты от бюджета, 5ч: 100% = 80% окна (резерв 20%)
+
+ 5ч    [#############.....................]  37.5%  (30% окна)  сброс 1ч 34м  откл -45%  хватит до сброса (14.0%/ч)
+```
+
+The scaling is never silent: the header states the budget, the row keeps the
+raw window figure in parentheses, and the status line marks the window with an
+asterisk (`5ч* 38%`). The projection and the deviation are scaled too, so
+`КОНЕЦ через ...` means running out of your share, not of the window.
+
+The reserve only affects presentation. `--json` stays raw, and the sample
+history is stored raw as well, so changing the reserve does not corrupt past
+measurements. A malformed config is a hard error rather than a silent fallback
+to zero, because quietly counting against the wrong budget is the one failure
+this feature exists to prevent.
 
 ## Install
 
@@ -73,7 +113,8 @@ cc-limits --refresh       # only refresh the cache and exit (for background use)
 ```
 
 `NO_COLOR=1` disables color. `CC_LIMITS_FORCE_COLOR=1` forces it on when stdout
-is not a TTY.
+is not a TTY. `CC_LIMITS_RESERVE_5H` and `CC_LIMITS_RESERVE_7D` set the
+[reserve](#shared-account-reserving-part-of-a-window).
 
 ## Status line integration
 
@@ -132,12 +173,20 @@ extra-usage state. `--json` prints it untouched.
 
 ### Rate limiting
 
-That endpoint has its own sliding request window of roughly five minutes and
-answers `429` with a `Retry-After` header when you poll it too hard. `cc-limits`
-obeys the header: it records the deadline in
-`$CLAUDE_CONFIG_DIR/cache/cc-limits-throttle`, serves the cached numbers with
-their age labeled, and counts down to the retry instead of hammering the
-server. Hence the 120s cache TTL and the 60s floor on `--watch`.
+That endpoint has a request window of its own and answers `429` when you poll
+it too hard. It does send a `Retry-After` header, but that header is not
+trustworthy here: once the window is spent it keeps answering `429` while
+advertising a retry of zero or one second, so obeying it literally produces a
+tight retry loop.
+
+So `cc-limits` waits for whichever is longer, the header or its own backoff:
+60s on the first `429`, doubling per consecutive one, capped at 15 minutes, and
+reset by the first success. The deadline and the strike count live in
+`$CLAUDE_CONFIG_DIR/cache/cc-limits-throttle`. While it waits it serves the
+cached numbers with their age labeled, and the label turns yellow past five
+minutes and red past fifteen, because deciding how hard to work off stale
+limit data is the mistake worth flagging. Hence also the 120s cache TTL and the
+60s floor on `--watch`.
 
 ### The projection
 
