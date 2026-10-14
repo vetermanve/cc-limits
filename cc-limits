@@ -1,0 +1,605 @@
+#!/usr/bin/env python3
+"""
+cc-limits - индикатор лимитов Claude Code (5-часовой и недельный).
+
+Данные берутся из того же эндпоинта, что использует сам Claude Code:
+  GET https://api.anthropic.com/api/oauth/usage
+OAuth-токен берётся оттуда же, откуда его берёт Claude Code:
+$CLAUDE_CODE_OAUTH_TOKEN, macOS Keychain (service "Claude Code-credentials")
+или ~/.claude/.credentials.json.
+
+Режимы:
+  cc-limits                 одноразовый вывод (из кэша, если свежий)
+  cc-limits --force         игнорировать кэш, запросить сервер
+  cc-limits --watch [сек]   живой индикатор (по умолчанию 120 сек, минимум 60)
+  cc-limits --statusline     компакт в одну строку (для statusLine Claude Code)
+  cc-limits --json           сырой ответ API
+  cc-limits --refresh        только обновить кэш и выйти (для фона)
+
+Кэш: $CLAUDE_CONFIG_DIR/cache/cc-limits-cache.json (TTL 120 сек)
+История: там же, cc-limits-history.jsonl (для расчёта скорости расхода)
+"""
+
+import json
+import os
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+API_URL = "https://api.anthropic.com/api/oauth/usage"
+KEYCHAIN_SERVICE = "Claude Code-credentials"
+OAUTH_BETA = "oauth-2025-04-20"
+USER_AGENT = "claude-cli/2.1.273 (external, cli)"
+
+# Claude Code держит конфиг в $CLAUDE_CONFIG_DIR, иначе в ~/.claude
+CONFIG_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR") or (Path.home() / ".claude"))
+CREDENTIALS_FILE = CONFIG_DIR / ".credentials.json"
+CACHE_DIR = CONFIG_DIR / "cache"
+CACHE_FILE = CACHE_DIR / "cc-limits-cache.json"
+HISTORY_FILE = CACHE_DIR / "cc-limits-history.jsonl"
+CACHE_TTL = 120  # сек
+# Эндпоинт /api/oauth/usage имеет скользящее окно лимита (~5 мин) и на 429
+# присылает Retry-After. Мы его чтим: THROTTLE_FILE хранит момент, раньше
+# которого запрос не делаем.
+MIN_WATCH_INTERVAL = 60.0
+THROTTLE_FILE = CACHE_DIR / "cc-limits-throttle"
+HISTORY_MAX = 2000  # строк, дальше обрезаем
+
+# длины окон в секундах
+WINDOW_5H = 5 * 3600
+WINDOW_7D = 7 * 24 * 3600
+
+C_RESET = "\033[0m"
+C_DIM = "\033[2m"
+C_BOLD = "\033[1m"
+C_GREEN = "\033[32m"
+C_YELLOW = "\033[33m"
+C_RED = "\033[31m"
+C_CYAN = "\033[36m"
+
+
+def color_enabled() -> bool:
+    if os.environ.get("NO_COLOR"):
+        return False
+    return sys.stdout.isatty() or os.environ.get("CC_LIMITS_FORCE_COLOR") == "1"
+
+
+def paint(text: str, color: str, on: bool) -> str:
+    return f"{color}{text}{C_RESET}" if on else text
+
+
+def dev_color(dev: float) -> str:
+    """
+    Отклонение от равномерного темпа: ноль или запас - зелёный,
+    перерасход - жёлтый. Решение по округлённому значению, чтобы цвет не
+    противоречил выведенной цифре (иначе +0.4% рисуется как "0%", но жёлтым).
+    """
+    return C_GREEN if round(dev) <= 0 else C_YELLOW
+
+
+def fmt_dev(dev: float) -> str:
+    """
+    Отклонение в процентах от равномерного темпа, со знаком.
+    Выше +999% уже ничего не говорит - обрезаем.
+    """
+    if dev > 999:
+        return ">+999%"
+    r = round(dev)
+    return "0%" if r == 0 else f"{r:+d}%"
+
+
+def level_color(pct: float) -> str:
+    if pct >= 85:
+        return C_RED
+    if pct >= 60:
+        return C_YELLOW
+    return C_GREEN
+
+
+# --- получение данных --------------------------------------------------------
+
+
+def read_keychain() -> str:
+    """Содержимое записи Keychain (macOS). Пустая строка, если нет."""
+    if sys.platform != "darwin":
+        return ""
+    try:
+        return subprocess.run(
+            ["security", "find-generic-password", "-a", os.environ.get("USER", ""),
+             "-w", "-s", KEYCHAIN_SERVICE],
+            capture_output=True, text=True, timeout=10, check=True,
+        ).stdout
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+        return ""
+
+
+def read_token() -> dict:
+    """
+    OAuth-токен Claude Code. Источники в том же порядке, что у самого
+    Claude Code: переменная окружения, Keychain (macOS), файл
+    ~/.claude/.credentials.json (Linux и macOS без Keychain).
+    """
+    env_token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
+    if env_token:
+        return {"accessToken": env_token, "expiresAt": None}
+
+    raw = read_keychain()
+    source = "Keychain"
+    if not raw:
+        try:
+            raw = CREDENTIALS_FILE.read_text()
+            source = str(CREDENTIALS_FILE)
+        except OSError:
+            raise RuntimeError(
+                "токен не найден (ни Keychain, ни "
+                f"{CREDENTIALS_FILE}), выполни /login в Claude Code"
+            )
+    try:
+        return json.loads(raw)["claudeAiOauth"]
+    except (json.JSONDecodeError, KeyError) as e:
+        raise RuntimeError(f"не разобрал токен из {source}: {e}")
+
+
+def fetch_usage() -> dict:
+    tok = read_token()
+    expires_at = tok.get("expiresAt")
+    if expires_at and expires_at / 1000 < time.time():
+        raise RuntimeError("OAuth-токен истёк, запусти claude чтобы он обновился")
+    req = urllib.request.Request(
+        API_URL,
+        headers={
+            "Authorization": "Bearer " + tok["accessToken"],
+            "anthropic-beta": OAUTH_BETA,
+            "Content-Type": "application/json",
+            "User-Agent": USER_AGENT,
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.load(resp)
+    except urllib.error.HTTPError as e:
+        body = e.read()[:200].decode("utf-8", "replace")
+        if e.code == 401:
+            raise RuntimeError("401: токен отвергнут, запусти claude для refresh")
+        if e.code == 429:
+            wait = 300
+            try:
+                wait = max(1, int(e.headers.get("Retry-After") or wait))
+            except ValueError:
+                pass
+            set_throttle(time.time() + wait)
+            raise RuntimeError(f"429: сервер просит подождать {fmt_dur(wait)}")
+        raise RuntimeError(f"HTTP {e.code}: {body}")
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"сеть недоступна: {e.reason}")
+
+
+def get_throttle() -> float:
+    """Момент времени, раньше которого запрос делать нельзя (0 если можно)."""
+    try:
+        return float(THROTTLE_FILE.read_text().strip())
+    except (OSError, ValueError):
+        return 0.0
+
+
+def set_throttle(until: float) -> None:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        THROTTLE_FILE.write_text(str(until))
+    except OSError:
+        pass
+
+
+def load_cache(max_age: float = CACHE_TTL):
+    """Возвращает (data, age_sec) или (None, None) если кэша нет/устарел."""
+    try:
+        st = CACHE_FILE.stat()
+    except OSError:
+        return None, None
+    age = time.time() - st.st_mtime
+    if max_age is not None and age > max_age:
+        return None, age
+    try:
+        return json.loads(CACHE_FILE.read_text()), age
+    except (json.JSONDecodeError, OSError):
+        return None, None
+
+
+def save_cache(data: dict) -> None:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = CACHE_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data))
+    tmp.replace(CACHE_FILE)
+
+
+def append_history(data: dict) -> None:
+    """Пишет точку замера для расчёта скорости расхода."""
+    row = {
+        "t": time.time(),
+        "h5": pct_of(data, "five_hour"),
+        "d7": pct_of(data, "seven_day"),
+        "h5_reset": reset_of(data, "five_hour"),
+        "d7_reset": reset_of(data, "seven_day"),
+    }
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    with HISTORY_FILE.open("a") as f:
+        f.write(json.dumps(row) + "\n")
+    # обрезка, чтобы файл не рос бесконечно
+    try:
+        lines = HISTORY_FILE.read_text().splitlines()
+        if len(lines) > HISTORY_MAX:
+            HISTORY_FILE.write_text("\n".join(lines[-HISTORY_MAX:]) + "\n")
+    except OSError:
+        pass
+
+
+def load_history() -> list:
+    try:
+        rows = []
+        for line in HISTORY_FILE.read_text().splitlines():
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+        return rows
+    except OSError:
+        return []
+
+
+def get_data(force: bool = False) -> tuple:
+    """Возвращает (data, age, err). Берёт из кэша если свежий."""
+    if not force:
+        cached, age = load_cache()
+        if cached is not None:
+            return cached, age, None
+
+    # сервер ранее ответил 429 - ждём указанный им срок, отдаём кэш
+    wait_left = get_throttle() - time.time()
+    if wait_left > 0:
+        stale, age = load_cache(max_age=None)
+        return stale, age, f"лимит запросов, повтор через {fmt_dur(wait_left)}"
+
+    try:
+        data = fetch_usage()
+    except RuntimeError as e:
+        stale, age = load_cache(max_age=None)
+        return stale, age, str(e)
+    save_cache(data)
+    append_history(data)
+    return data, 0.0, None
+
+
+# --- разбор ------------------------------------------------------------------
+
+
+def pct_of(data: dict, key: str):
+    node = (data or {}).get(key)
+    if not node:
+        return None
+    return node.get("utilization")
+
+
+def reset_of(data: dict, key: str):
+    node = (data or {}).get(key)
+    if not node or not node.get("resets_at"):
+        return None
+    return parse_iso(node["resets_at"])
+
+
+def parse_iso(s: str) -> float:
+    return datetime.fromisoformat(s).timestamp()
+
+
+def fmt_dur(sec: float) -> str:
+    if sec is None:
+        return "?"
+    sec = int(max(0, sec))
+    d, rem = divmod(sec, 86400)
+    h, rem = divmod(rem, 3600)
+    m = rem // 60
+    if d:
+        return f"{d}д {h}ч {m:02d}м"
+    if h:
+        return f"{h}ч {m:02d}м"
+    if m:
+        return f"{m}м"
+    return f"{sec}с"
+
+
+def burn_rate(rows: list, field: str, reset_field: str, reset_ts: float,
+              lookback: float, min_span: float):
+    """
+    Скорость расхода в %/час по замерам внутри текущего окна.
+    min_span - минимальный интервал между первым и последним замером, сек.
+    Экстраполировать неделю по шести минутам наблюдений нельзя, поэтому
+    пока разброс меньше min_span - честно отвечаем "данных мало".
+    Возвращает (rate_per_hour, n_samples) или (None, n_samples)."""
+    if reset_ts is None:
+        return None, 0
+    now = time.time()
+    # только замеры текущего окна (тот же resets_at) и не старше lookback
+    pts = [
+        r for r in rows
+        if r.get(field) is not None
+        and r.get(reset_field) is not None
+        and abs(r[reset_field] - reset_ts) < 120
+        and now - r["t"] <= lookback
+    ]
+    if len(pts) < 2:
+        return None, len(pts)
+    pts.sort(key=lambda r: r["t"])
+    span = pts[-1]["t"] - pts[0]["t"]
+    if span < min_span:
+        return None, len(pts)
+    dt = span / 3600.0
+    dp = pts[-1][field] - pts[0][field]
+    return dp / dt, len(pts)
+
+
+# Пока окно прошло меньше чем на MIN_ELAPSED_PCT, отклонение не считаем:
+# в первые минуты окна знаменатель близок к нулю и отношение улетает в тысячи
+# процентов, что ничего не говорит о реальном темпе.
+MIN_ELAPSED_PCT = 2.0
+
+
+def pace_dev(pct: float, reset_ts: float, window: float):
+    """
+    Отклонение расхода от равномерного бюджета окна, в процентах.
+    0% - идёшь ровно по равномерному темпу.
+    -60% - тратишь на 60% медленнее равномерного (запас).
+    +60% - на 60% быстрее равномерного (к сбросу упрёшься).
+    Возвращает (dev_pct, expected_pct) или (None, None).
+    """
+    if pct is None or reset_ts is None:
+        return None, None
+    window_start = reset_ts - window
+    elapsed = time.time() - window_start
+    if elapsed <= 0 or elapsed > window:
+        return None, None
+    expected = elapsed / window * 100
+    if expected < MIN_ELAPSED_PCT:
+        return None, expected
+    return (pct / expected - 1) * 100, expected
+
+
+# --- рендер ------------------------------------------------------------------
+
+
+def bar(pct: float, width: int, on: bool) -> str:
+    if pct is None:
+        return paint("-" * width, C_DIM, on)
+    filled = int(round(min(100.0, max(0.0, pct)) / 100 * width))
+    c = level_color(pct)
+    return paint("#" * filled, c, on) + paint("." * (width - filled), C_DIM, on)
+
+
+def render_line(label: str, data: dict, key: str, window: float,
+                rows: list, hist_field: str, hist_reset: str,
+                lookback: float, min_span: float, width: int, on: bool) -> str:
+    pct = pct_of(data, key)
+    reset_ts = reset_of(data, key)
+    if pct is None:
+        return f" {label:<4} " + paint("нет данных", C_DIM, on)
+
+    c = level_color(pct)
+    parts = [
+        f" {label:<4}",
+        "[" + bar(pct, width, on) + "]",
+        paint(f"{pct:5.1f}%", c + C_BOLD, on),
+    ]
+
+    if reset_ts is not None:
+        parts.append(paint(f"сброс {fmt_dur(reset_ts - time.time())}", C_DIM, on))
+
+    dev, expected = pace_dev(pct, reset_ts, window)
+    if dev is not None:
+        parts.append(paint(f"откл {fmt_dev(dev)}", dev_color(dev), on))
+    elif expected is not None:
+        parts.append(paint("откл: окно только началось", C_DIM, on))
+
+    rate, n = burn_rate(rows, hist_field, hist_reset, reset_ts, lookback, min_span)
+    if rate is None:
+        parts.append(paint(f"прогноз: мало замеров ({n})", C_DIM, on))
+    elif rate > 0.05:
+        eta = (100 - pct) / rate * 3600
+        remain = reset_ts - time.time() if reset_ts else None
+        if remain is not None and eta < remain:
+            parts.append(paint(f"КОНЕЦ через {fmt_dur(eta)} ({rate:.1f}%/ч)",
+                               C_RED + C_BOLD, on))
+        else:
+            parts.append(paint(f"хватит до сброса ({rate:.1f}%/ч)", C_GREEN, on))
+    else:
+        parts.append(paint("расход ~0", C_DIM, on))
+
+    return "  ".join(parts)
+
+
+def render(data: dict, age: float, err: str, width: int = 34) -> str:
+    on = color_enabled()
+    rows = load_history()
+    out = []
+
+    stamp = datetime.now().strftime("%H:%M:%S")
+    head = paint("Лимиты Claude Code", C_CYAN + C_BOLD, on)
+    agetxt = ""
+    if age is not None and age > 5:
+        agetxt = paint(f"  (данным {int(age)} сек)", C_DIM, on)
+    out.append(f"{head}  {paint(stamp, C_DIM, on)}{agetxt}")
+    out.append("")
+
+    if data is None:
+        out.append(" " + paint(f"ошибка: {err}", C_RED, on))
+        return "\n".join(out)
+
+    # 5ч: смотрим назад 2 часа, минимум 10 минут замеров
+    out.append(render_line("5ч", data, "five_hour", WINDOW_5H, rows,
+                           "h5", "h5_reset", 2 * 3600, 10 * 60, width, on))
+    # 7д: смотрим назад сутки, минимум 2 часа замеров
+    out.append(render_line("7д", data, "seven_day", WINDOW_7D, rows,
+                           "d7", "d7_reset", 24 * 3600, 2 * 3600, width, on))
+
+    # недельные лимиты по моделям, если включены
+    for key, label in (("seven_day_opus", "Opus"), ("seven_day_sonnet", "Sonnet")):
+        if pct_of(data, key) is not None:
+            out.append(render_line(label, data, key, WINDOW_7D, rows,
+                                   "d7", "d7_reset", 24 * 3600, 2 * 3600,
+                                   width, on))
+
+    # scoped-лимиты на модель (например Fable 50% недельной квоты)
+    for lim in data.get("limits") or []:
+        scope = lim.get("scope") or {}
+        model = (scope.get("model") or {}).get("display_name")
+        if lim.get("kind") == "weekly_scoped" and model:
+            p = lim.get("percent")
+            share = next((s for s in data.get("weekly_scoped_shares") or []
+                          if s.get("limit_index") == (data["limits"].index(lim))), None)
+            allow = share.get("allowance_percent_of_weekly") if share else None
+            tail = f" (квота {allow}% недели)" if allow is not None else ""
+            on_c = level_color(p or 0)
+            out.append(f" {model:<4}  [" + bar(p, width, on) + "]  "
+                       + paint(f"{p:5.1f}%", on_c, on) + paint(tail, C_DIM, on))
+
+    # на что ушла неделя
+    bd = data.get("seven_day_breakdown") or {}
+    srows = [r for r in bd.get("rows") or [] if (r.get("percent") or 0) > 0]
+    if srows:
+        txt = ", ".join(f"{r['display_name']} {r['percent']}%" for r in srows)
+        out.append("")
+        out.append(" " + paint("неделя: " + txt, C_DIM, on))
+
+    xu = data.get("extra_usage") or {}
+    if xu.get("is_enabled"):
+        out.append(" " + paint(
+            f"extra usage: {xu.get('utilization')}% от ${xu.get('monthly_limit')}",
+            C_DIM, on))
+
+    if err:
+        out.append("")
+        out.append(" " + paint(f"обновить не удалось: {err}", C_YELLOW, on))
+
+    return "\n".join(out)
+
+
+def render_statusline(data: dict, err: str) -> str:
+    on = color_enabled()
+    if data is None:
+        return paint("лимиты: n/a", C_DIM, on)
+    h5 = pct_of(data, "five_hour")
+    d7 = pct_of(data, "seven_day")
+    r5 = reset_of(data, "five_hour")
+    bits = []
+    if h5 is not None:
+        t = f" {fmt_dur(r5 - time.time())}" if r5 else ""
+        dev, _ = pace_dev(h5, r5, WINDOW_5H)
+        eq = ""
+        if dev is not None:
+            eq = " " + paint(fmt_dev(dev), dev_color(dev), on)
+        bits.append(paint(f"5ч {h5:.0f}%", level_color(h5), on) + eq
+                    + paint(t, C_DIM, on))
+    if d7 is not None:
+        dev, _ = pace_dev(d7, reset_of(data, "seven_day"), WINDOW_7D)
+        eq = ""
+        if dev is not None:
+            eq = " " + paint(fmt_dev(dev), dev_color(dev), on)
+        bits.append(paint(f"7д {d7:.0f}%", level_color(d7), on) + eq)
+    return paint("|", C_DIM, on).join(bits) if bits else ""
+
+
+# --- режимы ------------------------------------------------------------------
+
+
+def spawn_background_refresh() -> None:
+    """Асинхронно обновляет кэш, чтобы statusline не блокировался."""
+    try:
+        subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), "--refresh"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError:
+        pass
+
+
+def mode_statusline() -> int:
+    cached, age = load_cache()
+    if cached is None:
+        spawn_background_refresh()
+        stale, stale_age = load_cache(max_age=None)
+        if stale is None:
+            return 0  # ещё нет данных - молчим, не мусорим в statusline
+        print(render_statusline(stale, None), end="")
+        return 0
+    if age is not None and age > CACHE_TTL * 0.6:
+        spawn_background_refresh()
+    print(render_statusline(cached, None), end="")
+    return 0
+
+
+def mode_watch(interval: float) -> int:
+    sys.stdout.write("\033[?1049h\033[?25l")  # alt-screen, курсор прячем
+    sys.stdout.flush()
+    try:
+        while True:
+            data, age, err = get_data(force=True)
+            frame = render(data, age, err)
+            sys.stdout.write("\033[H\033[2J" + frame + "\n\n")
+            sys.stdout.write(f"\033[2mобновление каждые {int(interval)} сек, "
+                             f"Ctrl-C для выхода\033[0m\n")
+            sys.stdout.flush()
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        return 0
+    finally:
+        sys.stdout.write("\033[?25h\033[?1049l")
+        sys.stdout.flush()
+
+
+def main() -> int:
+    args = sys.argv[1:]
+
+    if "--help" in args or "-h" in args:
+        print(__doc__)
+        return 0
+
+    if "--refresh" in args:
+        data, _, err = get_data(force=True)
+        if err:
+            print(err, file=sys.stderr)
+            return 1
+        return 0
+
+    if "--json" in args:
+        data, _, err = get_data(force="--cache" not in args)
+        if data is None:
+            print(json.dumps({"error": err}), file=sys.stderr)
+            return 1
+        print(json.dumps(data, indent=2, ensure_ascii=False))
+        return 0
+
+    if "--statusline" in args:
+        return mode_statusline()
+
+    if "--watch" in args or "-w" in args:
+        flag = "--watch" if "--watch" in args else "-w"
+        idx = args.index(flag)
+        interval = 120.0
+        if len(args) > idx + 1:
+            try:
+                interval = max(MIN_WATCH_INTERVAL, float(args[idx + 1]))
+            except ValueError:
+                pass
+        return mode_watch(interval)
+
+    # по умолчанию кэш (TTL 120 сек), чтобы частые запуски не ели квоту
+    # эндпоинта; --force игнорирует кэш
+    data, age, err = get_data(force="--force" in args)
+    print(render(data, age, err))
+    return 0 if data is not None else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
