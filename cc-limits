@@ -641,6 +641,7 @@ def render_statusline(data: dict, err: str) -> str:
     h5 = pct_of(data, "five_hour")
     d7 = pct_of(data, "seven_day")
     r5 = reset_of(data, "five_hour")
+    r7 = reset_of(data, "seven_day")
     bits = []
     if h5 is not None:
         t = f" {fmt_dur(r5 - time.time())}" if r5 else ""
@@ -652,14 +653,15 @@ def render_statusline(data: dict, err: str) -> str:
         bits.append(paint(f"5ч{mark} {h5:.0f}%", risk_color(h5, dev, False), on)
                     + eq + paint(t, C_DIM, on))
     if d7 is not None:
-        dev, _ = pace_dev(d7, reset_of(data, "seven_day"), WINDOW_7D)
+        t = f" {fmt_dur(r7 - time.time())}" if r7 else ""
+        dev, _ = pace_dev(d7, r7, WINDOW_7D)
         eq = ""
         if dev is not None:
             eq = " " + paint(fmt_dev(dev), dev_color(dev), on)
         mark = "*" if reserves()["seven_day"] > 0 else ""
         bits.append(paint(f"7д{mark} {d7:.0f}%", risk_color(d7, dev, False), on)
-                    + eq)
-    return paint("|", C_DIM, on).join(bits) if bits else ""
+                    + eq + paint(t, C_DIM, on))
+    return paint(" | ", C_DIM, on).join(bits) if bits else ""
 
 
 # --- режимы ------------------------------------------------------------------

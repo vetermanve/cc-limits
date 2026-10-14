@@ -30,7 +30,7 @@ One-shot:
 In the Claude Code status line, refreshed every turn:
 
 ```
-> my-project  git:(main)  5ч 24% -61% 1ч 54м|7д 19% -76%
+> my-project  git:(main)  5ч 24% -61% 1ч 54м | 7д 19% -76% 1д 12ч 54м
 ```
 
 Reading a row:

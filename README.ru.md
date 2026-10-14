@@ -26,7 +26,7 @@ English README: [README.md](README.md)
 В статуслайне Claude Code, обновляется каждый ход:
 
 ```
-> my-project  git:(main)  5ч 24% -61% 1ч 54м|7д 19% -76%
+> my-project  git:(main)  5ч 24% -61% 1ч 54м | 7д 19% -76% 1д 12ч 54м
 ```
 
 Как читать строку:
