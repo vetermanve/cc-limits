@@ -105,6 +105,15 @@ printf '%s' '{"accounts":[{"name":"a","source":"keychain","hidden":"да"}]}' \
 check "битый конфиг: hidden не булев" 1 "hidden должен быть" \
     env CLAUDE_CONFIG_DIR="$badhidden" python3 "$CC" --accounts
 
+out=$(env CLAUDE_CONFIG_DIR="$hidden" CLAUDE_CODE_OAUTH_TOKEN=tok-личный python3 "$CC" --indicator 2>&1)
+if printf '%s' "$out" | grep -qF '"label": "флот"'; then
+    fail=$((fail + 1)); printf 'ПАДЕНИЕ скрытый аккаунт попал в --indicator\n'
+else
+    pass=$((pass + 1)); printf 'OK   скрытый аккаунт не в --indicator\n'
+fi
+check "скрытый виден в --diagnose" 0 '"hidden": true' \
+    env CLAUDE_CONFIG_DIR="$hidden" CLAUDE_CODE_OAUTH_TOKEN=tok-личный python3 "$CC" --diagnose
+
 check "--accounts помечает окно" 0 "это окно" \
     env CLAUDE_CONFIG_DIR="$multi" CLAUDE_CODE_OAUTH_TOKEN=tok-флот python3 "$CC" --accounts
 check "--account выбирает один" 0 "личный" \

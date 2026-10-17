@@ -249,10 +249,23 @@ cc-limits --watch 300     # ...every 300s
 cc-limits --statusline    # one compact line, for the Claude Code status line
 cc-limits --json          # raw API response for this window's account
 cc-limits --json --all    # raw API responses for every account
+cc-limits --indicator     # JSON with the computed pace, for external indicators
+cc-limits --diagnose      # JSON per account: source, fingerprint, scope, duplicates
+cc-limits --check-config FILE  # validate a candidate config, exit code 0/1
 cc-limits --accounts      # which accounts are declared, and this window's one
 cc-limits --account флот  # work with this account only
 cc-limits --refresh       # only refresh the cache and exit (for background use)
 ```
+
+`--indicator` and `--diagnose` exist for external consumers such as the
+[macOS menu bar indicator](macos/README.md). The first one never touches the
+network and reads only the cache, the way `--statusline` does, so it is safe
+to call every half a minute. The second one resolves token sources
+(`source=command` runs the command), so it is called on demand.
+
+`--check-config` reads the given file with the same code that reads the live
+config. It exists for settings editors: write a candidate to a temp file,
+validate it, and replace the live one only on a zero exit code.
 
 `NO_COLOR=1` disables color. `CC_LIMITS_FORCE_COLOR=1` forces it on when stdout
 is not a TTY. `CC_LIMITS_RESERVE_5H` and `CC_LIMITS_RESERVE_7D` set the

@@ -47,6 +47,13 @@ CC_LIMITS_RESERVE_7D. Тогда все проценты, отклонение �
   cc-limits --statusline    компакт в одну строку (для statusLine Claude Code)
   cc-limits --json          сырой ответ API по аккаунту этого окна
   cc-limits --json --all    сырые ответы по всем аккаунтам
+  cc-limits --indicator     JSON с посчитанным риском по всем аккаунтам,
+                            для внешних индикаторов (menu bar и т.п.); как
+                            --statusline, в сеть не лезет - кэш и фоновое
+                            обновление
+  cc-limits --diagnose      JSON по аккаунтам для окна настроек: источник,
+                            отпечаток токена, scope, возраст кэша, дубли
+  cc-limits --check-config ФАЙЛ  проверить конфиг-кандидат и выйти с кодом
   cc-limits --accounts      какие аккаунты описаны и какой у этого окна
   cc-limits --account ИМЯ   работать только с этим аккаунтом
   cc-limits --refresh       только обновить кэш и выйти (для фона)
@@ -1437,6 +1444,124 @@ def mode_statusline(forced: Account = None) -> int:
     return 0
 
 
+def mode_indicator() -> int:
+    """
+    JSON по всем аккаунтам для внешних индикаторов (например, menu bar app):
+    {"accounts": [{"label", "default", "age", "error",
+                   "windows": {"five_hour": window_status, "seven_day": ...}}]}.
+    Как --statusline: только кэш, в сеть не лезет (фоновое обновление теми же
+    спящими процессами), поэтому опрашивать можно часто без риска упереться
+    в throttle эндпоинта.
+    """
+    out_accounts = []
+    for acc in visible_accounts():
+        use_account(acc)
+        cached, age = load_cache()
+        wait_left = read_throttle()["until"] - time.time()
+        if cached is None:
+            if wait_left <= 0:
+                spawn_background_refresh()
+            cached, age = load_cache(max_age=None)
+
+        err = None
+        windows = {}
+        if cached is None:
+            verdict = read_scope_verdict()
+            if verdict.get("profile") is False:
+                err = NO_SCOPE_SHORT
+            elif wait_left > 0:
+                err = f"лимит запросов, повтор через {fmt_dur(wait_left)}"
+            else:
+                err = "нет данных"
+        else:
+            rows = load_history()
+            for _, key, window, hist_field, hist_reset, lookback, min_span in CORE_WINDOWS:
+                windows[key] = window_status(cached, key, window, rows,
+                                             hist_field, hist_reset, lookback,
+                                             min_span)
+
+        out_accounts.append({
+            "label": acc.label, "default": acc.default, "age": age,
+            "error": err, "windows": windows,
+        })
+
+    print(json.dumps({"accounts": out_accounts}, ensure_ascii=False))
+    return 0
+
+
+def mode_diagnose() -> int:
+    """
+    Полный срез по аккаунтам для окна настроек: источник токена, его
+    отпечаток, доступность scope, возраст кэша, резервы, пауза после 429.
+    Токены тут реально опрашиваются (source=command выполняет команду),
+    поэтому это отдельный режим, а не часть дешёвого --indicator, который
+    зовут раз в полминуты.
+
+    duplicates - группы аккаунтов с одним отпечатком: разные записи конфига,
+    за которыми стоит один и тот же токен. Молча считать их разными значило
+    бы показывать одни и те же цифры под двумя именами.
+    """
+    rows, by_fp = [], {}
+    for acc in accounts():
+        use_account(acc)
+        fp, token_err = None, None
+        try:
+            tok = acc.token().get("accessToken") or ""
+            if tok:
+                fp = fingerprint(tok)
+            else:
+                token_err = "источник не отдал токен"
+        except RuntimeError as e:
+            token_err = str(e)
+
+        verdict = read_scope_verdict()
+        # приговор по scope привязан к отпечатку: перевыпущенный токен не
+        # должен наследовать чужой вердикт
+        scope_ok = verdict.get("profile") if verdict.get("fp") == fp else None
+        _, age = load_cache(max_age=None)
+        wait_left = read_throttle()["until"] - time.time()
+
+        rows.append({
+            "name": acc.name, "label": acc.label, "default": acc.default,
+            "source": acc.source, "hidden": acc.hidden,
+            "fingerprint": fp[:8] if fp else None,
+            "token_error": token_err, "scope_ok": scope_ok,
+            "cache_age": age, "reserve": dict(reserves()),
+            "throttle_left": max(0.0, wait_left),
+        })
+        if fp:
+            by_fp.setdefault(fp, []).append(acc.label)
+
+    print(json.dumps({
+        "config": str(CONFIG_FILE),
+        "accounts": rows,
+        "duplicates": [names for names in by_fp.values() if len(names) > 1],
+    }, ensure_ascii=False))
+    return 0
+
+
+def mode_check_config(path: str) -> int:
+    """
+    Проверяет файл-кандидат тем же кодом, которым читается рабочий конфиг.
+    Нужен внешним редакторам настроек: пишешь временный файл, зовёшь проверку
+    и подменяешь рабочий только при нулевом коде возврата. Так валидация не
+    раздваивается на два языка и не расходится с ними.
+    """
+    global CONFIG_FILE, _CONFIG, _ACCOUNTS, _ACTIVE, _RESERVES
+    CONFIG_FILE = Path(os.path.expanduser(path))
+    _CONFIG = _ACCOUNTS = _ACTIVE = _RESERVES = None
+    try:
+        accs = accounts()
+        for acc in accs:
+            use_account(acc)
+            reserves()
+    except RuntimeError as e:
+        print(str(e), file=sys.stderr)
+        return 1
+    print(f"конфиг валиден, аккаунтов: {len(accs)}")
+    return 0
+
+
 def render_accounts(force: bool, width: int = 34, only: list = None) -> tuple:
     """
     (текст, все ли аккаунты отдали цифры). Блок на аккаунт под общей шапкой;
@@ -1492,6 +1617,14 @@ def main() -> int:
     if "--help" in args or "-h" in args:
         print(__doc__)
         return 0
+
+    # до чтения рабочего конфига: проверяем кандидата, рабочий может быть битым
+    if "--check-config" in args:
+        idx = args.index("--check-config")
+        if len(args) <= idx + 1:
+            print("--check-config без пути к файлу", file=sys.stderr)
+            return 1
+        return mode_check_config(args[idx + 1])
 
     # конфиг читаем до всего остального: если он битый, молча считать от
     # неправильного бюджета или не того аккаунта нельзя
@@ -1558,6 +1691,12 @@ def main() -> int:
             return 1
         print(json.dumps(data, indent=2, ensure_ascii=False))
         return 0
+
+    if "--indicator" in args:
+        return mode_indicator()
+
+    if "--diagnose" in args:
+        return mode_diagnose()
 
     if "--statusline" in args:
         return mode_statusline(forced)
