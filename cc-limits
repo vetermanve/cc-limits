@@ -89,11 +89,10 @@ WINDOW_MAP_FILE = CACHE_DIR / "cc-limits-window.json"
 PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
 SCOPE_FILE = CACHE_DIR / "cc-limits-scope.json"
 SCOPE_VERDICT_TTL = 24 * 3600  # сек, срок хранения приговора по scope
-NO_SCOPE_PAUSE = 6 * 3600      # сек, пауза при токене без scope
-NO_SCOPE_SHORT = "токен без scope user:profile"
+NO_SCOPE_SHORT = "токен без scope, лимиты недоступны"
 NO_SCOPE_FULL = (
-    "токен без scope user:profile: эндпоинт лимитов его не принимает. "
-    "Такой scope даёт вход через /login, а claude setup-token - нет"
+    "токен без scope user:profile - определение лимитов невозможно. "
+    "Этот scope даёт вход через /login, claude setup-token - нет"
 )
 CACHE_TTL = 120  # сек
 # Эндпоинт /api/oauth/usage имеет скользящее окно лимита (~5 мин) и на 429
@@ -686,6 +685,13 @@ def read_token() -> dict:
 
 def fetch_usage() -> dict:
     tok = read_token()
+    verdict = read_scope_verdict()
+    if (verdict.get("fp") == fingerprint(tok["accessToken"])
+            and verdict["profile"] is False):
+        # Токену не хватает scope - ответ эндпоинта предопределён, запрос
+        # был бы ритуалом. Приговор живёт сутки, так что перевыпущенный
+        # токен проверится заново.
+        raise RuntimeError(NO_SCOPE_FULL)
     expires_at = tok.get("expiresAt")
     if expires_at and expires_at / 1000 < time.time():
         raise RuntimeError("OAuth-токен истёк, запусти claude чтобы он обновился")
@@ -713,8 +719,6 @@ def fetch_usage() -> dict:
             # На токен без scope user:profile этот эндпоинт отвечает тоже 429,
             # и без отдельной проверки инструмент вечно обещал бы повтор.
             if profile_scope_known_missing(tok["accessToken"]):
-                write_throttle(time.time() + NO_SCOPE_PAUSE,
-                               read_throttle()["strikes"])
                 raise RuntimeError(NO_SCOPE_FULL)
             wait = note_rate_limit(e.headers.get("Retry-After"))
             raise RuntimeError(f"429: лимит запросов, пауза {fmt_dur(wait)}")
@@ -783,6 +787,10 @@ def profile_scope_known_missing(token: str):
     if has is None:
         return False
     write_scope_verdict(fp, has)
+    if has is False:
+        # пауза после 429 описывала не ту причину - снимаем, чтобы не
+        # показывать "повтор через" там, где повторять нечего
+        write_throttle(0.0, 0)
     return has is False
 
 
@@ -904,6 +912,22 @@ def get_data(force: bool = False) -> tuple:
         cached, age = load_cache()
         if cached is not None:
             return cached, age, None
+
+    # Приговор по scope сильнее паузы: если лимиты по токену недоступны,
+    # обещать повтор - врать. Отпечаток сверяем, чтобы перевыпущенный токен
+    # не наследовал чужой приговор.
+    verdict = read_scope_verdict()
+    if verdict.get("profile") is False:
+        try:
+            tok = read_token().get("accessToken") or ""
+        except RuntimeError as e:
+            stale, age = load_cache(max_age=None)
+            return stale, age, str(e)
+        if verdict.get("fp") == fingerprint(tok):
+            if read_throttle()["until"] > time.time():
+                write_throttle(0.0, 0)
+            stale, age = load_cache(max_age=None)
+            return stale, age, NO_SCOPE_FULL
 
     # сервер ранее ответил 429 - выдерживаем паузу, отдаём кэш
     wait_left = read_throttle()["until"] - time.time()

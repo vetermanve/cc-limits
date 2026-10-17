@@ -179,11 +179,13 @@ on the first `429` `cc-limits` asks `/api/oauth/profile` once and, when the
 scope is missing, says so outright:
 
 ```
-... | 19:05 | флот: токен без scope user:profile
+... | 19:05 | флот: токен без scope, лимиты недоступны
 ```
 
-and then holds a six-hour pause instead of pointless retries. There is no way
-to get limits for such a token: that needs a `/login` session.
+The verdict is remembered for a day, keyed by the token fingerprint, and after
+that no request is made at all - the answer is foregone. A re-minted token gets
+re-checked. There is no way to get limits for a token without that scope: it
+needs a `/login` session.
 
 Token sources are probed cheapest first and only until one matches, and the
 match is remembered for an hour in `cache/cc-limits-window.json` keyed by a

@@ -171,11 +171,26 @@ json.dump({'fp': sys.argv[2], 'profile': False, 't': time.time()},
           open(sys.argv[1], 'w'))
 " "$noscope/cache/cc-limits-scope-безскоупа.json" \
   "$(python3 -c "import hashlib;print(hashlib.sha256('tok-без'.encode()).hexdigest()[:16])")"
+# throttle намеренно не кладём: приговор по scope должен работать сам,
+# без паузы, и без запроса к серверу (токен заведомо битый - живой запрос
+# дал бы другую ошибку)
+check "одноразовый вывод: лимиты недоступны, запроса нет" 1 "определение лимитов невозможно" \
+    env CLAUDE_CONFIG_DIR="$noscope" CLAUDE_CODE_OAUTH_TOKEN=tok-без \
+    python3 "$CC" --account безскоупа --force
+# даже если от прежних 429 осталась пауза, причина должна быть про scope
 python3 -c "
 import json, time, sys
-json.dump({'until': time.time() + 21600, 'strikes': 1}, open(sys.argv[1], 'w'))
+json.dump({'until': time.time() + 21600, 'strikes': 4}, open(sys.argv[1], 'w'))
 " "$noscope/cache/cc-limits-throttle-безскоупа"
-check "статуслайн называет причину: нет scope" 0 "безскоупа: токен без scope user:profile" \
+check "пауза не подменяет причину" 1 "определение лимитов невозможно" \
+    env CLAUDE_CONFIG_DIR="$noscope" CLAUDE_CODE_OAUTH_TOKEN=tok-без \
+    python3 "$CC" --account безскоупа
+if [ -s "$noscope/cache/cc-limits-throttle-безскоупа" ] && grep -q '"until": 0' "$noscope/cache/cc-limits-throttle-безскоупа"; then
+    pass=$((pass + 1)); printf 'OK   мёртвая пауза снята\n'
+else
+    fail=$((fail + 1)); printf 'ПАДЕНИЕ пауза осталась: %s\n' "$(cat "$noscope/cache/cc-limits-throttle-безскоупа")"
+fi
+check "статуслайн называет причину: нет scope" 0 "безскоупа: токен без scope, лимиты недоступны" \
     env CLAUDE_CONFIG_DIR="$noscope" CLAUDE_CODE_OAUTH_TOKEN=tok-без \
     python3 "$CC" --statusline
 out="$(CLAUDE_CONFIG_DIR="$noscope" CLAUDE_CODE_OAUTH_TOKEN=tok-без python3 "$CC" --statusline 2>&1)"
