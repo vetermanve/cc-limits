@@ -21,7 +21,9 @@ check() {
     local bad=""
     [ "$rc" = "$want_rc" ] || bad="код $rc, ждали $want_rc"
     if [ "$want" != "-" ] && ! printf '%s' "$out" | grep -qF -- "$want"; then
-        bad="${bad:+$bad; }нет подстроки «$want»"
+        # имя переменной в фигурных скобках: иначе в не-UTF-8 локали bash
+        # приклеивает к нему байты кавычки-ёлочки и падает на unbound variable
+        bad="${bad:+$bad; }нет подстроки «${want}»"
     fi
     if [ -z "$bad" ]; then
         pass=$((pass + 1))
@@ -138,6 +140,16 @@ cat > "$empty/cc-limits.json" <<'JSON'
 {"accounts": [{"name": "пустой", "source": "token", "token": "tok-пустой"}]}
 JSON
 check "аккаунт без кэша: говорит, что данных нет" 0 "пустой: нет данных" \
+    env CLAUDE_CONFIG_DIR="$empty" CLAUDE_CODE_OAUTH_TOKEN=tok-пустой \
+    python3 "$CC" --statusline
+# пауза после 429: статуслайн пишет, когда будет повтор, и не плодит процессы
+mkdir -p "$empty/cache"
+python3 -c "
+import json, time, sys
+json.dump({'until': time.time() + 600, 'strikes': 3},
+          open(sys.argv[1], 'w'))
+" "$empty/cache/cc-limits-throttle-пустой"
+check "пауза после 429 видна в статуслайне" 0 "повтор через" \
     env CLAUDE_CONFIG_DIR="$empty" CLAUDE_CODE_OAUTH_TOKEN=tok-пустой \
     python3 "$CC" --statusline
 nocfg="$TMP/nocfg"; mkdir -p "$nocfg"

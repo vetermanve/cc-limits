@@ -1184,20 +1184,26 @@ def use_window_account(forced: Account = None) -> tuple:
 def mode_statusline(forced: Account = None) -> int:
     label, note = use_window_account(forced)
     cached, age = load_cache()
+    # Пока держится пауза после 429, обновлять нечего: фоновый процесс упёрся
+    # бы в тот же throttle, а статуслайн зовут каждый ход.
+    wait_left = read_throttle()["until"] - time.time()
     if cached is None:
-        spawn_background_refresh()
+        if wait_left <= 0:
+            spawn_background_refresh()
         stale, stale_age = load_cache(max_age=None)
         if stale is None:
             # Без аккаунтов молчим, чтобы не мусорить в пустом статуслайне. А
             # вот когда аккаунт подписан, пропавший индикатор выглядит как
-            # поломка: пишем, по какому аккаунту ещё нет цифр.
+            # поломка: пишем, по какому аккаунту нет цифр и когда повтор.
             if label:
-                print(paint(f"{label}: нет данных", C_DIM, color_enabled()),
-                      end="")
+                txt = f"{label}: нет данных"
+                if wait_left > 0:
+                    txt += f", повтор через {fmt_dur(wait_left)}"
+                print(paint(txt, C_DIM, color_enabled()), end="")
             return 0
         print(render_statusline(stale, None, stale_age, label, note), end="")
         return 0
-    if age is not None and age > CACHE_TTL * 0.6:
+    if age is not None and age > CACHE_TTL * 0.6 and wait_left <= 0:
         spawn_background_refresh()
     print(render_statusline(cached, None, age, label, note), end="")
     return 0
