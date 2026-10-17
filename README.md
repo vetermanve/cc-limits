@@ -109,6 +109,12 @@ measurements. A malformed config is a hard error rather than a silent fallback
 to zero, because quietly counting against the wrong budget is the one failure
 this feature exists to prevent.
 
+## macOS menu bar indicator
+
+Two rings in the status bar: the arc length is utilization, the color is the
+pace zone, and the disc in the middle is the burst over the last unit of the
+window. Build, design and settings are in [macos/README.md](macos/README.md).
+
 ## Multiple accounts
 
 There can be more than one token: your personal subscription in the Keychain
