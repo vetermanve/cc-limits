@@ -3,7 +3,9 @@ import PackageDescription
 
 let package = Package(
     name: "CCLimitsBar",
-    platforms: [.macOS(.v12)],
+    // macOS 13: Form(.grouped) и LabeledContent дают сетку настроек
+    // как в System Settings, руками её не собрать аккуратно
+    platforms: [.macOS(.v13)],
     targets: [
         // чистый разбор и сборка cc-limits.json - без AppKit и SwiftUI,
         // чтобы самый опасный код (запись чужого конфига) был под тестами
