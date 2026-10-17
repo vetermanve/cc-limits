@@ -109,6 +109,19 @@ HISTORY_MAX = 2000  # строк, дальше обрезаем
 WINDOW_5H = 5 * 3600
 WINDOW_7D = 7 * 24 * 3600
 
+# окна 5ч/7д: подпись, ключ API, длина окна, поля истории (замер + сброс
+# замера), глубина выборки и минимум её разброса для расчёта скорости
+# расхода. Общее для текстового рендера (render) и машиночитаемого
+# --indicator, чтобы они не расходились в том, как считают.
+#
+# Глубина выборки - одна "единица" окна: час из пяти часов, сутки из семи
+# дней. Это и есть окно "рывка": темп прямо сейчас, в отличие от
+# накопленного темпа по всему окну.
+CORE_WINDOWS = (
+    ("5ч", "five_hour", WINDOW_5H, "h5", "h5_reset", WINDOW_5H / 5, 10 * 60),
+    ("7д", "seven_day", WINDOW_7D, "d7", "d7_reset", WINDOW_7D / 7, 2 * 3600),
+)
+
 C_RESET = "\033[0m"
 C_DIM = "\033[2m"
 C_BOLD = "\033[1m"
@@ -217,12 +230,9 @@ def paint(text: str, color: str, on: bool) -> str:
 
 
 def dev_color(dev: float) -> str:
-    """
-    Отклонение от равномерного темпа: запас и ноль зелёным, перерасход жёлтым.
-    Решение по округлённому значению, чтобы цвет не противоречил выведенной
-    цифре (иначе +0.4% рисуется как "0%", но жёлтым).
-    """
-    return C_YELLOW if round(dev) > 0 else C_GREEN
+    """Отклонение красим той же зоной темпа, что и сам процент: dev - это
+    pace в других единицах, разные цвета у них противоречили бы друг другу."""
+    return _LEVEL_ANSI[pace_level(None if dev is None else dev / 100.0 + 1.0)]
 
 
 def fmt_dev(dev: float) -> str:
@@ -248,18 +258,47 @@ def age_color(age: float) -> str:
     return C_DIM
 
 
-def risk_color(pct: float, dev, running_out: bool) -> str:
+# Цвет кодирует СКОРОСТЬ поедания бюджета, а не остаток. Инструмент нужен,
+# чтобы держать агрессивный, но не самоубийственный темп: красный значит
+# "жжёшь слишком быстро", а не "лимиты кончились". Кончившиеся лимиты и так
+# видно по отказам агентов, красить их незачем.
+#
+#   pace = накопленный темп / равномерный = pct / expected
+#
+# При таком темпе 100% наступит на доле окна 1/pace, то есть "сухим"
+# останешься dry = 1 - 1/pace. Пороги заданы через dry, поэтому одинаково
+# осмысленны и для пяти часов, и для недели.
+PACE_UNDER = 0.5          # к сбросу съешь меньше половины - можно жать сильнее
+DRY_OVER = 0.25           # сухим больше четверти окна - это уже перебор
+PACE_OVER = 1.0 / (1.0 - DRY_OVER)
+
+
+def pace_of(pct: float, expected: float):
     """
-    Цвет расхода по риску, а не по абсолютному уровню. Голый процент о риске
-    ничего не говорит: 60% за десять минут до сброса - это запас. Красный,
-    когда бюджет уже выбран или прогноз говорит, что упрёшься до сброса;
-    жёлтый, когда жжёшь быстрее равномерного темпа; иначе зелёный.
+    Накопленный темп в долях равномерного. None, пока окно только началось:
+    в первые минуты знаменатель близок к нулю и отношение улетает в тысячи
+    процентов, ничего не говоря о реальном темпе (см. MIN_ELAPSED_PCT).
     """
-    if pct >= 100 or running_out:
-        return C_RED
-    if dev is not None and round(dev) > 0:
-        return C_YELLOW
-    return C_GREEN
+    if pct is None or not expected or expected < MIN_ELAPSED_PCT:
+        return None
+    return pct / expected
+
+
+def pace_level(pace) -> str:
+    """Зона темпа: idle/green/yellow/red, gray пока темп неизвестен."""
+    if pace is None:
+        return "gray"
+    if pace > PACE_OVER:
+        return "red"
+    if pace > 1.0:
+        return "yellow"
+    if pace < PACE_UNDER:
+        return "idle"
+    return "green"
+
+
+_LEVEL_ANSI = {"idle": C_CYAN, "green": C_GREEN, "yellow": C_YELLOW,
+               "red": C_RED, "gray": C_DIM}
 
 
 
@@ -1057,17 +1096,30 @@ def bar(pct: float, width: int, on: bool, color: str = "") -> str:
                                                   C_DIM, on)
 
 
-def render_line(label: str, data: dict, key: str, window: float,
-                rows: list, hist_field: str, hist_reset: str,
-                lookback: float, min_span: float, width: int, on: bool) -> str:
+def window_status(data: dict, key: str, window: float, rows: list,
+                  hist_field: str, hist_reset: str, lookback: float,
+                  min_span: float) -> dict:
+    """
+    Посчитанный статус окна: бюджет, накопленный темп с его зоной, куда
+    придёшь к сбросу при этом темпе, и отдельно рывок последних замеров
+    (rate/eta/running_out). Общее ядро для текстового рендера (render_line) и
+    машиночитаемого --indicator, чтобы они не могли разойтись в расчётах.
+    """
     reserve = reserve_for(key)
     raw = raw_pct_of(data, key)
     pct = to_budget(raw, reserve)
     reset_ts = reset_of(data, key)
+    status = {
+        "pct": pct, "raw_pct": raw, "reserve": reserve, "reset_ts": reset_ts,
+        "remain": None, "dev": None, "expected": None, "rate": None, "n": 0,
+        "eta": None, "running_out": False, "level": "gray",
+        "pace": None, "avg_rate": None, "projected_pct": None, "dry": 0.0,
+        "in_reserve": False, "burst_pace": None, "burst_level": "gray",
+        "burst_projected_pct": None,
+    }
     if pct is None:
-        return f" {label:<4} " + paint("нет данных", C_DIM, on)
+        return status
 
-    # отклонение и прогноз считаются раньше вывода: по ним красится процент
     dev, expected = pace_dev(pct, reset_ts, window)
     rate, n = burn_rate(rows, hist_field, hist_reset, reset_ts, lookback,
                         min_span, reserve)
@@ -1075,7 +1127,49 @@ def render_line(label: str, data: dict, key: str, window: float,
     eta = (100 - pct) / rate * 3600 if rate and rate > 0.05 else None
     running_out = eta is not None and remain is not None and eta < remain
 
-    c = risk_color(pct, dev, running_out)
+    # накопленный темп сглажен по всему окну, поэтому им и красим; рывок
+    # последних суток живёт рядом в rate/eta и цвет не трогает
+    pace = pace_of(pct, expected)
+    avg_rate = None
+    if pace is not None:
+        elapsed_h = expected / 100.0 * window / 3600.0
+        avg_rate = pct / elapsed_h if elapsed_h > 0 else None
+    # рывок: темп последней "единицы" окна в долях равномерного. Накопленный
+    # темп сглажен простоем, рывок - нет; вместе они отвечают на разные
+    # вопросы ("как иду по окну" и "как ем прямо сейчас")
+    even_rate = 100.0 / (window / 3600.0)
+    burst_pace = rate / even_rate if rate is not None else None
+
+    status.update(
+        remain=remain, dev=dev, expected=expected, rate=rate, n=n,
+        eta=eta, running_out=running_out, pace=pace, avg_rate=avg_rate,
+        burst_pace=burst_pace, burst_level=pace_level(burst_pace),
+        # куда пришёл бы к сбросу, если держать текущий рывок всё окно
+        burst_projected_pct=(burst_pace * 100.0 if burst_pace is not None else None),
+        # при сохранении темпа к сбросу придёшь ровно в pace * 100% бюджета
+        projected_pct=(pace * 100.0 if pace is not None else None),
+        dry=(1.0 - 1.0 / pace if pace and pace > 1.0 else 0.0),
+        # бюджет выбран, но окно ещё живо: дальше идёт чужая доля
+        in_reserve=(pct >= 100 and reserve > 0),
+        level=pace_level(pace),
+    )
+    return status
+
+
+def render_line(label: str, data: dict, key: str, window: float,
+                rows: list, hist_field: str, hist_reset: str,
+                lookback: float, min_span: float, width: int, on: bool) -> str:
+    st = window_status(data, key, window, rows, hist_field, hist_reset,
+                       lookback, min_span)
+    pct, raw, reserve = st["pct"], st["raw_pct"], st["reserve"]
+    if pct is None:
+        return f" {label:<4} " + paint("нет данных", C_DIM, on)
+
+    reset_ts, dev, expected = st["reset_ts"], st["dev"], st["expected"]
+    rate, n, remain = st["rate"], st["n"], st["remain"]
+    eta, running_out = st["eta"], st["running_out"]
+
+    c = _LEVEL_ANSI[st["level"]]
     parts = [
         f" {label:<4}",
         "[" + bar(pct, width, on, c) + "]",
@@ -1098,10 +1192,11 @@ def render_line(label: str, data: dict, key: str, window: float,
     elif eta is None:
         parts.append(paint("расход ~0", C_DIM, on))
     elif running_out:
-        parts.append(paint(f"КОНЕЦ через {fmt_dur(eta)} ({rate:.1f}%/ч)",
-                           C_RED + C_BOLD, on))
+        # рывок последних замеров: сообщаем, но не кричим - цвет держит темп
+        parts.append(paint(f"по рывку кончится через {fmt_dur(eta)} "
+                           f"({rate:.1f}%/ч)", C_DIM, on))
     else:
-        parts.append(paint(f"хватит до сброса ({rate:.1f}%/ч)", C_GREEN, on))
+        parts.append(paint(f"хватит до сброса ({rate:.1f}%/ч)", C_DIM, on))
 
     return "  ".join(parts)
 
@@ -1139,12 +1234,9 @@ def render(data: dict, age: float, err: str, width: int = 34,
         out.append(" " + paint(f"ошибка: {err}", C_RED, on))
         return "\n".join(out)
 
-    # 5ч: смотрим назад 2 часа, минимум 10 минут замеров
-    out.append(render_line("5ч", data, "five_hour", WINDOW_5H, rows,
-                           "h5", "h5_reset", 2 * 3600, 10 * 60, width, on))
-    # 7д: смотрим назад сутки, минимум 2 часа замеров
-    out.append(render_line("7д", data, "seven_day", WINDOW_7D, rows,
-                           "d7", "d7_reset", 24 * 3600, 2 * 3600, width, on))
+    for label, key, window, hist_field, hist_reset, lookback, min_span in CORE_WINDOWS:
+        out.append(render_line(label, data, key, window, rows, hist_field,
+                               hist_reset, lookback, min_span, width, on))
 
     # недельные лимиты по моделям, если включены
     for key, label in (("seven_day_opus", "Opus"), ("seven_day_sonnet", "Sonnet")):
@@ -1154,6 +1246,8 @@ def render(data: dict, age: float, err: str, width: int = 34,
                                    width, on))
 
     # scoped-лимиты на модель (например Fable 50% недельной квоты)
+    # scoped-лимиты живут в недельном окне, темп считаем от его прошедшей доли
+    expected7 = pace_dev(0.0, reset_of(data, "seven_day"), WINDOW_7D)[1]
     for lim in data.get("limits") or []:
         scope = lim.get("scope") or {}
         model = (scope.get("model") or {}).get("display_name")
@@ -1163,7 +1257,7 @@ def render(data: dict, age: float, err: str, width: int = 34,
                           if s.get("limit_index") == (data["limits"].index(lim))), None)
             allow = share.get("allowance_percent_of_weekly") if share else None
             tail = f" (квота {allow}% недели)" if allow is not None else ""
-            pc = risk_color(p or 0, None, False)
+            pc = _LEVEL_ANSI[pace_level(pace_of(p, expected7))]
             out.append(f" {model:<4}  [" + bar(p, width, on, pc) + "]  "
                        + paint(f"{p:5.1f}%", pc, on) + paint(tail, C_DIM, on))
 
@@ -1220,7 +1314,7 @@ def render_statusline(data: dict, err: str, age: float = None,
         if dev is not None:
             eq = " " + paint(fmt_dev(dev), dev_color(dev), on)
         mark = "*" if reserves()["five_hour"] > 0 else ""
-        bits.append(paint(f"5ч{mark} {h5:.0f}%", risk_color(h5, dev, False), on)
+        bits.append(paint(f"5ч{mark} {h5:.0f}%", dev_color(dev), on)
                     + eq + paint(t, C_DIM, on))
     if d7 is not None:
         t = f" {fmt_dur(r7 - time.time())}" if r7 else ""
@@ -1229,7 +1323,7 @@ def render_statusline(data: dict, err: str, age: float = None,
         if dev is not None:
             eq = " " + paint(fmt_dev(dev), dev_color(dev), on)
         mark = "*" if reserves()["seven_day"] > 0 else ""
-        bits.append(paint(f"7д{mark} {d7:.0f}%", risk_color(d7, dev, False), on)
+        bits.append(paint(f"7д{mark} {d7:.0f}%", dev_color(dev), on)
                     + eq + paint(t, C_DIM, on))
 
     # время последнего обновления: кэш живёт до двух минут, а при 429 и дольше,

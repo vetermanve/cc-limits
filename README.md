@@ -40,14 +40,34 @@ Reading a row:
 | `24.0%` | utilization of the usable budget, which is the whole window unless you set a [reserve](#shared-account-reserving-part-of-a-window). Colored by risk, see below |
 | `сброс 1ч 54м` | time until the window resets |
 | `откл -61%` | deviation from an even burn of the budget: `0%` is exactly on pace, `-61%` means you are 61% slower than even (you have slack), `+20%` means 20% faster. Green at or below zero, yellow above |
-| `хватит до сброса (8.5%/ч)` | measured burn rate and whether it lasts until the reset. Turns into a red `КОНЕЦ через 1ч 30м` when the projection says you run out first |
+| `хватит до сброса (8.5%/ч)` | burn rate measured over the last unit of the window (one hour out of five, one day out of seven) and whether it lasts until the reset |
 
-The utilization figure is colored by risk, not by its own level: red once the
-budget is spent (at or above 100%) or the projection says you run out before
-the reset, yellow while you burn faster than an even pace, green otherwise. A
-raw percentage says nothing about risk on its own, which is why an absolute
+The utilization figure is colored by **how fast you are eating the budget**,
+not by what is left. The point of the tool is to hold an aggressive but not
+suicidal pace, so red means "you are burning too fast", not "limits are gone":
+exhausted limits are obvious anyway, your agents start failing.
+
+The number behind the color is the accumulated pace as a fraction of an even
+burn, `pace = pct / expected`. At that pace you hit 100% at `1/pace` of the
+window, so you sit dry for `1 - 1/pace` of it:
+
+| Zone | Condition | Meaning |
+| --- | --- | --- |
+| cyan | `pace < 0.5` | you will eat less than half the budget by the reset, push harder |
+| green | `0.5 ≤ pace ≤ 1.0` | you arrive at the reset roughly at zero |
+| yellow | `1.0 < pace ≤ 1.33` | you sit dry for up to a quarter of the window |
+| red | `pace > 1.33` | you sit dry for more than a quarter of the window |
+
+The thresholds are expressed as "how much of the window you spend without
+limits", which is why they mean the same thing for five hours and for a week.
+A raw percentage says nothing about pace on its own, which is why an absolute
 threshold would lie: 60% ten minutes before the reset is slack, and painting it
 yellow would contradict the deviation sitting right next to it.
+
+The accumulated pace is smoothed by idle time, so the projection from the
+latest burst is a separate caption on the row and never drives the color: it
+answers a different question, "how fast am I eating right now" rather than "how
+am I doing across the window".
 
 ## Shared account: reserving part of a window
 
