@@ -8,6 +8,7 @@
 
 import AppKit
 import CCLimitsCore
+import Combine
 import SwiftUI
 
 // MARK: - запуск cc-limits
@@ -157,10 +158,16 @@ final class ConfigStore: ObservableObject {
     @Published var diag: [String: DiagAccount] = [:]
     @Published var duplicates: [[String]] = []
     @Published var diagLoading = false
-    @Published var error: String?
-    @Published var note: String?
+    /// Почему правка ещё не на диске. nil - всё записано.
+    @Published private(set) var validation: String?
+    @Published private(set) var savedAt: Date?
 
     private var raw: [String: Any] = [:]
+    /// Последнее, что реально легло в файл: с ним сверяемся, чтобы
+    /// автосохранение не крутилось само от себя
+    private var lastWritten: Data?
+    private var autosave: AnyCancellable?
+    private let saveQueue = DispatchQueue(label: "cc-limits.bar.autosave")
 
     var configPath: String { claudeConfigDir + "/cc-limits.json" }
 
@@ -172,6 +179,12 @@ final class ConfigStore: ObservableObject {
     init() {
         load()
         refreshDiagnose()
+        // Кнопки «Сохранить» нет, правки уезжают в файл сами. Дёргать
+        // валидатор на каждое нажатие клавиши незачем, поэтому пауза: заодно
+        // промежуточные состояния вроде пустого имени не доходят до диска.
+        autosave = objectWillChange
+            .debounce(for: .milliseconds(600), scheduler: RunLoop.main)
+            .sink { [weak self] in self?.applyChanges() }
     }
 
     func load() {
@@ -180,6 +193,9 @@ final class ConfigStore: ObservableObject {
         reserve5 = p.reserve5
         reserve7 = p.reserve7
         accounts = p.accounts
+        // то, что сейчас в форме, уже лежит в файле - записывать нечего
+        lastWritten = try? ConfigDocument.jsonData(p)
+        validation = nil
     }
 
     func refreshDiagnose() {
@@ -192,7 +208,7 @@ final class ConfigStore: ObservableObject {
                 guard let snap else {
                     let msg = String(data: r.err, encoding: .utf8)?
                         .trimmingCharacters(in: .whitespacesAndNewlines)
-                    self.error = (msg?.isEmpty == false) ? msg : "не прочитал диагностику аккаунтов"
+                    self.report((msg?.isEmpty == false) ? msg! : "не прочитал диагностику аккаунтов")
                     return
                 }
                 self.diag = Dictionary(uniqueKeysWithValues: snap.accounts.map { ($0.label, $0) })
@@ -201,38 +217,43 @@ final class ConfigStore: ObservableObject {
         }
     }
 
-    func save() {
-        error = nil
-        note = nil
+    /// Пишет форму на диск, если она валидна. Кандидата проверяет тот же
+    /// `cc-limits --check-config`, которым читается рабочий конфиг: битую
+    /// форму на диск не кладём, а говорим в подвале окна, что с ней не так.
+    private func applyChanges() {
         guard let data = try? ConfigDocument.jsonData(parsed) else {
-            error = "не собрал JSON из формы"
+            report("не собрал JSON из формы")
             return
         }
-        let tmp = NSTemporaryDirectory() + "cc-limits-candidate-\(UUID().uuidString).json"
-        do {
-            try data.write(to: URL(fileURLWithPath: tmp))
-        } catch {
-            self.error = "не записал временный файл: \(error.localizedDescription)"
-            return
-        }
-        defer { try? FileManager.default.removeItem(atPath: tmp) }
+        guard data != lastWritten else { return }
 
-        let check = runCC(["--check-config", tmp])
-        if check.code != 0 {
-            let msg = String(data: check.err, encoding: .utf8)?
-                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            error = msg.isEmpty ? "конфиг не прошёл проверку" : msg
-            return
+        let path = configPath
+        saveQueue.async { [weak self] in
+            guard let self else { return }
+            // проверка и запись - в CCLimitsWriter, он под тестами: это код,
+            // который переписывает чужой файл
+            let problem = ConfigWriter.write(data, to: path) { candidate in
+                let check = runCC(["--check-config", candidate])
+                return (check.code, String(data: check.err, encoding: .utf8) ?? "")
+            }
+            if let problem {
+                self.report(problem)
+                return
+            }
+            DispatchQueue.main.async {
+                self.lastWritten = data
+                if self.validation != nil { self.validation = nil }
+                self.savedAt = Date()
+            }
         }
-        do {
-            try data.write(to: URL(fileURLWithPath: configPath), options: .atomic)
-        } catch {
-            self.error = "не записал \(configPath): \(error.localizedDescription)"
-            return
+    }
+
+    private func report(_ text: String) {
+        DispatchQueue.main.async {
+            // присваиваем только при изменении: каждое присваивание будит
+            // objectWillChange, на котором висит само автосохранение
+            if self.validation != text { self.validation = text }
         }
-        note = "сохранено"
-        load()
-        refreshDiagnose()
     }
 
 }
@@ -274,6 +295,8 @@ func percentField(_ text: Binding<String>, placeholder: String) -> some View {
 
 struct AccountsTabView: View {
     @ObservedObject var store: ConfigStore
+    /// Аккаунт, для которого спрошено подтверждение удаления
+    @State private var pendingDelete: AccountRow?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -313,12 +336,17 @@ struct AccountsTabView: View {
 
             footerBar
         }
-        .alert("Не удалось сохранить", isPresented: Binding(
-            get: { store.error != nil },
-            set: { if !$0 { store.error = nil } })) {
-            Button("Понятно", role: .cancel) { store.error = nil }
-        } message: {
-            Text(store.error ?? "")
+        .alert("Удалить аккаунт?", isPresented: Binding(
+            get: { pendingDelete != nil },
+            set: { if !$0 { pendingDelete = nil } }),
+            presenting: pendingDelete) { account in
+            Button("Удалить", role: .destructive) {
+                store.accounts.removeAll { $0.id == account.id }
+                pendingDelete = nil
+            }
+            Button("Отмена", role: .cancel) { pendingDelete = nil }
+        } message: { account in
+            Text("«\(account.name)» исчезнет из конфига вместе с резервом и источником токена. Чтобы просто убрать его с глаз, хватит скрытия.")
         }
     }
 
@@ -365,17 +393,23 @@ struct AccountsTabView: View {
             LabeledContent("Резерв, 7 дней") {
                 percentField(account.reserve7, placeholder: "общий")
             }
-            Toggle("Показывать в индикаторе", isOn: Binding(
-                get: { !account.wrappedValue.hidden },
-                set: { account.hidden.wrappedValue = !$0 }))
-
             diagnostics(diag, hidden: row.hidden)
         } header: {
-            HStack {
+            HStack(spacing: 10) {
                 Text(row.name.isEmpty ? "Без имени" : row.name)
                 Spacer()
                 Button {
-                    store.accounts.removeAll { $0.id == row.id }
+                    account.hidden.wrappedValue.toggle()
+                } label: {
+                    Image(systemName: row.hidden ? "eye.slash" : "eye")
+                }
+                .buttonStyle(.borderless)
+                .foregroundStyle(.secondary)
+                .help(row.hidden
+                      ? "Скрыт: вернуть в кольца, меню и статуслайн"
+                      : "Скрыть из колец, меню и статуслайна, не удаляя")
+                Button {
+                    pendingDelete = row
                 } label: {
                     Image(systemName: "trash")
                 }
@@ -440,14 +474,17 @@ struct AccountsTabView: View {
         return lines
     }
 
+    /// Правки применяются сами, поэтому подвал показывает не кнопку, а
+    /// состояние записи: без него непонятно, уехало ли изменение на диск.
     private var footerBar: some View {
         HStack(spacing: 12) {
-            Text(store.configPath)
+            Label(statusText, systemImage: statusSymbol)
                 .font(.caption)
                 .foregroundStyle(.secondary)
-                .lineLimit(1)
+                .lineLimit(2)
                 .truncationMode(.middle)
-            Spacer()
+                .help(store.configPath)
+            Spacer(minLength: 12)
             Button(store.diagLoading ? "Проверяю..." : "Проверить токены") {
                 store.refreshDiagnose()
             }
@@ -456,12 +493,28 @@ struct AccountsTabView: View {
                 store.load()
                 store.refreshDiagnose()
             }
-            Button("Сохранить") { store.save() }
-                .keyboardShortcut(.defaultAction)
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 12)
         .background(.bar)
+    }
+
+    private var statusText: String {
+        if let problem = store.validation {
+            return "Не сохранено: \(problem)"
+        }
+        if let at = store.savedAt {
+            let f = DateFormatter()
+            f.dateFormat = "HH:mm:ss"
+            return "Сохранено в \(f.string(from: at))"
+        }
+        return store.configPath
+    }
+
+    private var statusSymbol: String {
+        if store.validation != nil { return "exclamationmark.triangle" }
+        if store.savedAt != nil { return "checkmark.circle" }
+        return "doc"
     }
 }
 

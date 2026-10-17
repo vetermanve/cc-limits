@@ -119,3 +119,64 @@ final class ConfigDocumentTests: XCTestCase {
         XCTAssertTrue(text.contains("личный"), "в файле должна быть кириллица, а не \\u-экранирование")
     }
 }
+
+final class ConfigWriterTests: XCTestCase {
+    private var target: String!
+
+    override func setUp() {
+        super.setUp()
+        target = NSTemporaryDirectory() + "cc-limits-target-\(UUID().uuidString).json"
+        try? Data("{\"было\": true}".utf8).write(to: URL(fileURLWithPath: target))
+    }
+
+    override func tearDown() {
+        try? FileManager.default.removeItem(atPath: target)
+        super.tearDown()
+    }
+
+    private func read() -> String {
+        (try? String(contentsOfFile: target, encoding: .utf8)) ?? ""
+    }
+
+    func testГодногоКандидатаЗаписывает() {
+        let problem = ConfigWriter.write(Data("{\"стало\": true}".utf8), to: target) { _ in
+            (0, "")
+        }
+        XCTAssertNil(problem)
+        XCTAssertEqual(read(), "{\"стало\": true}")
+    }
+
+    func testБитогоКандидатаНеЗаписывает() {
+        let problem = ConfigWriter.write(Data("{\"стало\": true}".utf8), to: target) { _ in
+            (1, "accounts[0] без name\n")
+        }
+        XCTAssertEqual(problem, "accounts[0] без name")
+        XCTAssertEqual(read(), "{\"было\": true}", "рабочий конфиг трогать нельзя")
+    }
+
+    func testВалидаторВидитИменноКандидата() {
+        var seen: String?
+        _ = ConfigWriter.write(Data("{\"стало\": true}".utf8), to: target) { candidate in
+            seen = try? String(contentsOfFile: candidate, encoding: .utf8)
+            return (0, "")
+        }
+        XCTAssertEqual(seen, "{\"стало\": true}")
+    }
+
+    func testВременныйФайлУбирается() {
+        var candidate: String?
+        _ = ConfigWriter.write(Data("{}".utf8), to: target) { path in
+            candidate = path
+            return (0, "")
+        }
+        XCTAssertNotNil(candidate)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: candidate!),
+                       "кандидат должен убираться и после успеха")
+    }
+
+    func testМолчаливыйОтказВсёравноОбъясняется() {
+        let problem = ConfigWriter.write(Data("{}".utf8), to: target) { _ in (1, "   ") }
+        XCTAssertEqual(problem, "конфиг не прошёл проверку")
+        XCTAssertEqual(read(), "{\"было\": true}")
+    }
+}
