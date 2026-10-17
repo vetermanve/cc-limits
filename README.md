@@ -145,6 +145,14 @@ A per-account `reserve` overrides the global
 an `accounts` section nothing changes: one account, the previous cache file
 names, no labels in the output.
 
+`"hidden": true` drops an account from the regular output, the status line and
+`--indicator` without deleting its declaration. It is for entries you keep
+around: a `claude setup-token` token, for one, cannot report limits at all (it
+has no `user:profile` scope), yet throwing away the command that fetches it
+would be a waste. A hidden account still shows up in `--accounts` marked
+`(скрыт)`, in `--diagnose`, and is reachable through an explicit
+`--account NAME`.
+
 The one-shot output prints a block per account, with the current window's
 account marked:
 

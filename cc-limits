@@ -22,6 +22,10 @@ source: auto (как Claude Code: переменная, Keychain, файл), key
 credentials, env (+ "var"), file (+ "path"), command (+ "command"),
 token (+ "token"). У каждого аккаунта свои кэш, история и throttle.
 
+"hidden": true убирает аккаунт из индикатора, статуслайна и обычного вывода,
+не удаляя его описание. По явному --account ИМЯ он по-прежнему доступен и
+виден в --accounts/--diagnose.
+
 В statusline последним через ту же вертикальную черту печатается имя
 аккаунта, которым работает ЭТО окно: токен окна берётся из окружения процесса
 claude (переменную Claude Code не передаёт потомкам). Соответствие токена и
@@ -327,6 +331,12 @@ class Account:
         self.spec = spec
         self.source = spec.get("source") or "auto"
         self.default = default
+        # скрытый аккаунт остаётся в конфиге со всеми настройками, но не
+        # попадает в автоматические поверхности (индикатор, статуслайн,
+        # обычный вывод). Нужен, когда запись держат про запас: например,
+        # токен без scope user:profile лимиты не отдаст, а удалять описание
+        # команды его получения жалко
+        self.hidden = spec.get("hidden", False)
         self.reserve_raw = dict(spec.get("reserve") or {})
         self.slug = slugify(name) if name else ""
         if default:
@@ -444,6 +454,9 @@ def load_accounts() -> list:
             raise RuntimeError(f"{CONFIG_FILE}: accounts[{i}] ({name}): source="
                                f"{src!r}, ожидал один из "
                                f"{', '.join(ACCOUNT_SOURCES)}")
+        if not isinstance(spec.get("hidden", False), bool):
+            raise RuntimeError(f"{CONFIG_FILE}: accounts[{i}] ({name}): "
+                               f"hidden должен быть true или false")
         acc = Account(name, spec)
         if name in seen_names:
             raise RuntimeError(f"{CONFIG_FILE}: аккаунт {name} описан дважды")
@@ -485,6 +498,15 @@ def adopt_legacy_files(accs: list) -> None:
                 shutil.copy2(src, dst)
         except OSError:
             pass
+
+
+def visible_accounts() -> list:
+    """
+    Аккаунты, которые показываем сами. Скрытые остаются доступны по явному
+    --account ИМЯ и видны в --accounts/--diagnose: скрытие прячет запись из
+    вывода, но не отменяет её существования.
+    """
+    return [a for a in accounts() if not a.hidden]
 
 
 def active() -> Account:
@@ -1420,7 +1442,7 @@ def render_accounts(force: bool, width: int = 34, only: list = None) -> tuple:
     (текст, все ли аккаунты отдали цифры). Блок на аккаунт под общей шапкой;
     единственный аккаунт по умолчанию печатается как раньше, без подписей.
     """
-    accs = only if only else accounts()
+    accs = only if only else visible_accounts()
     show_labels = not (len(accs) == 1 and accs[0].default)
     current = None
     if show_labels:
@@ -1480,7 +1502,8 @@ def main() -> int:
             if len(args) <= idx + 1:
                 raise RuntimeError("--account без имени аккаунта")
             forced = account_by_name(args[idx + 1])
-        selected = [forced] if forced else accounts()
+        # по умолчанию работаем с видимыми; явный --account достаёт и скрытый
+        selected = [forced] if forced else (visible_accounts() or accounts())
         use_account(selected[0])
         reserves()
     except RuntimeError as e:
@@ -1496,6 +1519,8 @@ def main() -> int:
         cur, note = session_account()
         for acc in accounts():
             mark = "  <- это окно" if acc is cur else ""
+            if acc.hidden:
+                mark += "  (скрыт)"
             print(f"{acc.label}  source={acc.source}{mark}")
         if note:
             print(f"окно: {note}", file=sys.stderr)

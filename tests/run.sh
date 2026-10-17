@@ -80,6 +80,31 @@ check "статуслайн: другое окно - другой аккаунт
     env CLAUDE_CONFIG_DIR="$multi" CLAUDE_CODE_OAUTH_TOKEN=tok-личный python3 "$CC" --statusline
 check "незнакомый токен окна: предупреждение" 0 "аккаунт ?" \
     env CLAUDE_CONFIG_DIR="$multi" CLAUDE_CODE_OAUTH_TOKEN=tok-чужой python3 "$CC" --statusline
+# --- скрытый аккаунт: остаётся в конфиге, уходит из вывода
+hidden="$TMP/hidden"
+python3 "$HERE/fixture.py" "$hidden" "личный" "флот" >/dev/null
+cat > "$hidden/cc-limits.json" <<'JSON'
+{"accounts": [
+  {"name": "личный", "source": "token", "token": "tok-личный"},
+  {"name": "флот", "source": "token", "token": "tok-флот", "hidden": true}
+]}
+JSON
+out=$(env CLAUDE_CONFIG_DIR="$hidden" CLAUDE_CODE_OAUTH_TOKEN=tok-личный python3 "$CC" 2>&1)
+if printf '%s' "$out" | grep -qF "флот"; then
+    fail=$((fail + 1)); printf 'ПАДЕНИЕ скрытый аккаунт попал в обычный вывод\n'
+else
+    pass=$((pass + 1)); printf 'OK   скрытый аккаунт не в обычном выводе\n'
+fi
+check "скрытый виден в --accounts с пометкой" 0 "(скрыт)" \
+    env CLAUDE_CONFIG_DIR="$hidden" CLAUDE_CODE_OAUTH_TOKEN=tok-личный python3 "$CC" --accounts
+check "скрытый достаётся явным --account" 0 "флот" \
+    env CLAUDE_CONFIG_DIR="$hidden" CLAUDE_CODE_OAUTH_TOKEN=tok-личный python3 "$CC" --account флот
+badhidden="$TMP/badhidden"; mkdir -p "$badhidden"
+printf '%s' '{"accounts":[{"name":"a","source":"keychain","hidden":"да"}]}' \
+    > "$badhidden/cc-limits.json"
+check "битый конфиг: hidden не булев" 1 "hidden должен быть" \
+    env CLAUDE_CONFIG_DIR="$badhidden" python3 "$CC" --accounts
+
 check "--accounts помечает окно" 0 "это окно" \
     env CLAUDE_CONFIG_DIR="$multi" CLAUDE_CODE_OAUTH_TOKEN=tok-флот python3 "$CC" --accounts
 check "--account выбирает один" 0 "личный" \
