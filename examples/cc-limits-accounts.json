@@ -1,0 +1,19 @@
+{
+  "reserve": {
+    "seven_day": 0
+  },
+  "accounts": [
+    {
+      "name": "личный",
+      "source": "keychain"
+    },
+    {
+      "name": "флот",
+      "source": "file",
+      "path": "~/.secrets/fleet-token",
+      "reserve": {
+        "five_hour": 50
+      }
+    }
+  ]
+}

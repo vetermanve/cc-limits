@@ -8,26 +8,55 @@ OAuth-токен берётся оттуда же, откуда его берё�
 $CLAUDE_CODE_OAUTH_TOKEN, macOS Keychain (service "Claude Code-credentials")
 или ~/.claude/.credentials.json.
 
+Несколько аккаунтов (личная подписка и, скажем, общий токен парка машин)
+описываются в $CLAUDE_CONFIG_DIR/cc-limits.json:
+
+  {"accounts": [
+     {"name": "личный", "source": "keychain"},
+     {"name": "флот",   "source": "command",
+      "command": "security find-generic-password -s fleet-token -w",
+      "reserve": {"five_hour": 50}}
+  ]}
+
+source: auto (как Claude Code: переменная, Keychain, файл), keychain,
+credentials, env (+ "var"), file (+ "path"), command (+ "command"),
+token (+ "token"). У каждого аккаунта свои кэш, история и throttle.
+
+В statusline последним через ту же вертикальную черту печатается имя
+аккаунта, которым работает ЭТО окно: токен окна берётся из окружения процесса
+claude (переменную Claude Code не передаёт потомкам). Соответствие токена и
+аккаунта кэшируется по отпечатку (cache/cc-limits-window.json), чтобы дорогие
+источники вроде менеджера секретов не опрашивались каждый ход. Если токен окна
+в конфиге не описан, вместо имени выводится предупреждение - цифры тогда не
+про это окно.
+
 Если аккаунт общий и часть окна надо держать в резерве, резерв задаётся в
-$CLAUDE_CONFIG_DIR/cc-limits.json ({"reserve": {"five_hour": 20}}) или
-переменными CC_LIMITS_RESERVE_5H / CC_LIMITS_RESERVE_7D. Тогда все проценты,
-отклонение и прогноз считаются от оставшегося бюджета: при резерве 20%
-расход 80% окна показывается как 100%.
+cc-limits.json ({"reserve": {"five_hour": 20}}), для отдельного аккаунта -
+в accounts[].reserve, либо переменными CC_LIMITS_RESERVE_5H /
+CC_LIMITS_RESERVE_7D. Тогда все проценты, отклонение и прогноз считаются от
+оставшегося бюджета: при резерве 20% расход 80% окна показывается как 100%.
 
 Режимы:
   cc-limits                 одноразовый вывод (из кэша, если свежий)
   cc-limits --force         игнорировать кэш, запросить сервер
   cc-limits --watch [сек]   живой индикатор (по умолчанию 120 сек, минимум 60)
-  cc-limits --statusline     компакт в одну строку (для statusLine Claude Code)
-  cc-limits --json           сырой ответ API
-  cc-limits --refresh        только обновить кэш и выйти (для фона)
+  cc-limits --statusline    компакт в одну строку (для statusLine Claude Code)
+  cc-limits --json          сырой ответ API по аккаунту этого окна
+  cc-limits --json --all    сырые ответы по всем аккаунтам
+  cc-limits --accounts      какие аккаунты описаны и какой у этого окна
+  cc-limits --account ИМЯ   работать только с этим аккаунтом
+  cc-limits --refresh       только обновить кэш и выйти (для фона)
 
-Кэш: $CLAUDE_CONFIG_DIR/cache/cc-limits-cache.json (TTL 120 сек)
+Кэш: $CLAUDE_CONFIG_DIR/cache/cc-limits-cache.json (TTL 120 сек), у
+именованных аккаунтов - cc-limits-cache-ИМЯ.json
 История: там же, cc-limits-history.jsonl (для расчёта скорости расхода)
 """
 
+import hashlib
 import json
 import os
+import re
+import shutil
 import subprocess
 import sys
 import time
@@ -46,8 +75,13 @@ CONFIG_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR") or (Path.home() / ".claude
 CREDENTIALS_FILE = CONFIG_DIR / ".credentials.json"
 CONFIG_FILE = CONFIG_DIR / "cc-limits.json"
 CACHE_DIR = CONFIG_DIR / "cache"
+# Файлы аккаунта по умолчанию (конфиг без accounts). У именованных аккаунтов
+# к имени добавляется слаг, см. Account.
 CACHE_FILE = CACHE_DIR / "cc-limits-cache.json"
 HISTORY_FILE = CACHE_DIR / "cc-limits-history.jsonl"
+# соответствие "отпечаток токена окна -> аккаунт", чтобы не опрашивать
+# источники токенов на каждый вызов статуслайна
+WINDOW_MAP_FILE = CACHE_DIR / "cc-limits-window.json"
 CACHE_TTL = 120  # сек
 # Эндпоинт /api/oauth/usage имеет скользящее окно лимита (~5 мин) и на 429
 # присылает Retry-After. Мы его чтим: THROTTLE_FILE хранит момент, раньше
@@ -72,6 +106,26 @@ C_RED = "\033[31m"
 C_CYAN = "\033[36m"
 
 
+_CONFIG = None
+
+
+def config() -> dict:
+    """Содержимое cc-limits.json. Нет файла - пустой конфиг."""
+    global _CONFIG
+    if _CONFIG is None:
+        try:
+            raw = json.loads(CONFIG_FILE.read_text())
+        except FileNotFoundError:
+            raw = {}
+        except (OSError, json.JSONDecodeError) as e:
+            raise RuntimeError(f"не разобрал {CONFIG_FILE}: {e}")
+        if not isinstance(raw, dict):
+            raise RuntimeError(f"{CONFIG_FILE}: ожидал объект, получил "
+                               f"{type(raw).__name__}")
+        _CONFIG = raw
+    return _CONFIG
+
+
 def load_reserves() -> dict:
     """
     Резерв - доля окна, которую нельзя тратить (например, аккаунт общий и
@@ -81,17 +135,16 @@ def load_reserves() -> dict:
 
     Источники, последний побеждает:
       $CLAUDE_CONFIG_DIR/cc-limits.json -> {"reserve": {"five_hour": 20}}
+      там же accounts[].reserve - резерв конкретного аккаунта
       переменные CC_LIMITS_RESERVE_5H / CC_LIMITS_RESERVE_7D
     По умолчанию резерва нет и показываются сырые проценты окна.
     """
     reserves = {"five_hour": 0.0, "seven_day": 0.0}
 
-    try:
-        raw = json.loads(CONFIG_FILE.read_text()).get("reserve") or {}
-    except FileNotFoundError:
-        raw = {}
-    except (OSError, json.JSONDecodeError, AttributeError) as e:
-        raise RuntimeError(f"не разобрал {CONFIG_FILE}: {e}")
+    raw = dict(config().get("reserve") or {})
+    acc = active()
+    if acc is not None:
+        raw.update(acc.reserve_raw)
 
     for key in reserves:
         if key in raw:
@@ -120,7 +173,7 @@ _RESERVES = None
 
 
 def reserves() -> dict:
-    """Резервы окон, читаются один раз за запуск."""
+    """Резервы окон активного аккаунта, считаются один раз на аккаунт."""
     global _RESERVES
     if _RESERVES is None:
         _RESERVES = load_reserves()
@@ -198,6 +251,361 @@ def risk_color(pct: float, dev, running_out: bool) -> str:
 
 
 
+# --- аккаунты ----------------------------------------------------------------
+
+# Токены разных аккаунтов (личная подписка, общий токен парка машин) считают
+# свои окна лимитов, поэтому у каждого аккаунта отдельные кэш, история и
+# throttle: перемешанная история превратила бы скорость расхода и прогноз в
+# бессмыслицу, а 429 по одному токену запирал бы запросы по другому.
+
+ACCOUNT_SOURCES = ("auto", "keychain", "credentials", "env", "file",
+                   "command", "token")
+
+
+def slugify(name: str) -> str:
+    """Имя аккаунта в часть имени файла. Кириллицу оставляем как есть."""
+    slug = re.sub(r"[^\w.-]+", "-", name, flags=re.UNICODE).strip("-.")
+    return slug.lower() or "acc"
+
+
+class Account:
+    """Откуда берётся токен аккаунта и где лежат его кэш, история, throttle."""
+
+    def __init__(self, name: str, spec: dict, default: bool = False):
+        self.name = name
+        self.spec = spec
+        self.source = spec.get("source") or "auto"
+        self.default = default
+        self.reserve_raw = dict(spec.get("reserve") or {})
+        self.slug = slugify(name) if name else ""
+        if default:
+            # конфиг без accounts: имена файлов как были, чтобы накопленная
+            # история не осиротела при обновлении
+            self.cache_file = CACHE_FILE
+            self.history_file = HISTORY_FILE
+            self.throttle_file = THROTTLE_FILE
+        else:
+            self.cache_file = CACHE_DIR / f"cc-limits-cache-{self.slug}.json"
+            self.history_file = CACHE_DIR / f"cc-limits-history-{self.slug}.jsonl"
+            self.throttle_file = CACHE_DIR / f"cc-limits-throttle-{self.slug}"
+        self._token = None
+
+    @property
+    def label(self) -> str:
+        return self.name or "аккаунт по умолчанию"
+
+    def token(self) -> dict:
+        """{"accessToken": ..., "expiresAt": ...}. Читается один раз."""
+        if self._token is None:
+            self._token = self._read_token()
+        return self._token
+
+    def access_token(self) -> str:
+        """Токен или пустая строка, если источник недоступен."""
+        try:
+            return self.token().get("accessToken") or ""
+        except RuntimeError:
+            return ""
+
+    def _read_token(self) -> dict:
+        src = self.source
+        if src == "auto":
+            return read_token_auto()
+        if src == "keychain":
+            return parse_credentials(read_keychain(), "Keychain")
+        if src == "credentials":
+            return parse_credentials(read_credentials_file(), str(CREDENTIALS_FILE))
+        if src == "token":
+            return self._raw(self.spec.get("token"), "accounts.token")
+        if src == "env":
+            var = self.spec.get("var") or "CLAUDE_CODE_OAUTH_TOKEN"
+            return self._raw(os.environ.get(var), f"переменная {var}")
+        if src == "file":
+            path = self.spec.get("path")
+            if not path:
+                raise RuntimeError(f"аккаунт {self.label}: source=file без path")
+            f = Path(os.path.expanduser(path))
+            try:
+                return self._raw(f.read_text(), str(f))
+            except OSError as e:
+                raise RuntimeError(f"аккаунт {self.label}: не прочитал {f}: {e}")
+        if src == "command":
+            cmd = self.spec.get("command")
+            if not cmd:
+                raise RuntimeError(f"аккаунт {self.label}: source=command без command")
+            try:
+                out = subprocess.run(
+                    cmd, shell=isinstance(cmd, str), capture_output=True,
+                    text=True, timeout=20, check=True,
+                ).stdout
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired,
+                    OSError) as e:
+                raise RuntimeError(f"аккаунт {self.label}: команда токена не "
+                                   f"сработала: {e}")
+            return self._raw(out, f"вывод команды аккаунта {self.label}")
+        raise RuntimeError(f"аккаунт {self.label}: неизвестный source={src!r}")
+
+    def _raw(self, value, where: str) -> dict:
+        """
+        Источник отдаёт либо голый токен, либо JSON сессии Claude Code
+        (.credentials.json и вывод security find-generic-password). У голого
+        токена срока нет: oat-токен от claude setup-token не рефрешится и
+        expiresAt в нём не лежит.
+        """
+        text = (value or "").strip()
+        if not text:
+            raise RuntimeError(f"аккаунт {self.label}: пустой токен ({where})")
+        if text.startswith("{"):
+            return parse_credentials(text, where)
+        return {"accessToken": text, "expiresAt": None}
+
+
+_ACCOUNTS = None
+_ACTIVE = None
+
+
+def accounts() -> list:
+    """Аккаунты из конфига. Без секции accounts - один аккаунт по умолчанию."""
+    global _ACCOUNTS
+    if _ACCOUNTS is None:
+        _ACCOUNTS = load_accounts()
+    return _ACCOUNTS
+
+
+def load_accounts() -> list:
+    raw = config().get("accounts")
+    if raw is None:
+        return [Account(None, {"source": "auto"}, default=True)]
+    if not isinstance(raw, list) or not raw:
+        raise RuntimeError(f"{CONFIG_FILE}: accounts должен быть непустым списком")
+
+    out, seen_names, seen_slugs = [], set(), set()
+    for i, spec in enumerate(raw):
+        if not isinstance(spec, dict):
+            raise RuntimeError(f"{CONFIG_FILE}: accounts[{i}] должен быть объектом")
+        name = (spec.get("name") or "").strip()
+        if not name:
+            raise RuntimeError(f"{CONFIG_FILE}: accounts[{i}] без name")
+        src = spec.get("source") or "auto"
+        if src not in ACCOUNT_SOURCES:
+            raise RuntimeError(f"{CONFIG_FILE}: accounts[{i}] ({name}): source="
+                               f"{src!r}, ожидал один из "
+                               f"{', '.join(ACCOUNT_SOURCES)}")
+        acc = Account(name, spec)
+        if name in seen_names:
+            raise RuntimeError(f"{CONFIG_FILE}: аккаунт {name} описан дважды")
+        if acc.slug in seen_slugs:
+            raise RuntimeError(f"{CONFIG_FILE}: имена аккаунтов дают одинаковые "
+                               f"имена файлов ({acc.slug}), переименуй")
+        seen_names.add(name)
+        seen_slugs.add(acc.slug)
+        # резерв аккаунта проверяем здесь же, чтобы битый конфиг падал сразу
+        for key, value in acc.reserve_raw.items():
+            if key not in ("five_hour", "seven_day"):
+                raise RuntimeError(f"{CONFIG_FILE}: accounts[{i}] ({name}): "
+                                   f"reserve.{key} - нет такого окна")
+            parse_reserve(value, f"{CONFIG_FILE}: accounts[{i}].reserve.{key}")
+        out.append(acc)
+    adopt_legacy_files(out)
+    return out
+
+
+def adopt_legacy_files(accs: list) -> None:
+    """
+    Кэш и история безымянного аккаунта достаются первому аккаунту, который
+    читает тот же токен (keychain/credentials/auto). Иначе появление секции
+    accounts обнуляло бы накопленные замеры: проценты вернулись бы со второго
+    запроса, а прогноз ушёл бы в "мало замеров" на часы.
+
+    Копируем, а не переносим: если конфиг откатят, прежние файлы на месте.
+    Проверка "у наследника ещё нет своего файла" делает перенос однократным.
+    """
+    heir = next((a for a in accs
+                 if a.source in ("auto", "keychain", "credentials")), None)
+    if heir is None:
+        return
+    for src, dst in ((CACHE_FILE, heir.cache_file),
+                     (HISTORY_FILE, heir.history_file)):
+        try:
+            if src.exists() and not dst.exists():
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, dst)
+        except OSError:
+            pass
+
+
+def active() -> Account:
+    """Аккаунт, с которым сейчас работаем."""
+    global _ACTIVE
+    if _ACTIVE is None:
+        _ACTIVE = accounts()[0]
+    return _ACTIVE
+
+
+def use_account(acc: Account) -> None:
+    """Переключает активный аккаунт: у него свои файлы и свой резерв."""
+    global _ACTIVE, _RESERVES
+    _ACTIVE = acc
+    _RESERVES = None
+
+
+def account_by_name(name: str) -> Account:
+    for a in accounts():
+        if a.name == name or (a.default and name in ("default", "по умолчанию")):
+            return a
+    known = ", ".join(a.label for a in accounts())
+    raise RuntimeError(f"аккаунт {name!r} не описан в {CONFIG_FILE} (есть: {known})")
+
+
+# --- какой аккаунт у текущего окна -------------------------------------------
+
+
+def pid_ppid(pid: int):
+    try:
+        out = subprocess.run(["ps", "-o", "ppid=", "-p", str(pid)],
+                             capture_output=True, text=True, timeout=5).stdout
+        return int(out.strip())
+    except (subprocess.TimeoutExpired, OSError, ValueError):
+        return None
+
+
+def pid_env_var(pid: int, var: str) -> str:
+    """
+    Значение переменной в окружении процесса.
+
+    Linux отдаёт окружение через /proc, macOS - через ps eww. Важное
+    ограничение (проверено 2026-10-17): ps показывает окружение на момент
+    exec, поэтому у шелла переменных из .zshrc не видно, а у запущенного им
+    процесса claude - видно. Нам нужен именно claude, так что годится.
+    """
+    try:
+        with open(f"/proc/{pid}/environ", "rb") as f:
+            for chunk in f.read().split(b"\0"):
+                k, _, v = chunk.decode("utf-8", "replace").partition("=")
+                if k == var:
+                    return v
+        return ""
+    except OSError:
+        pass
+    try:
+        out = subprocess.run(["ps", "eww", "-p", str(pid)],
+                             capture_output=True, text=True, timeout=5).stdout
+    except (subprocess.TimeoutExpired, OSError):
+        return ""
+    m = re.search(r"(?:^|\s)" + re.escape(var) + r"=(\S*)", out)
+    return m.group(1) if m else ""
+
+
+def session_token() -> str:
+    """
+    Токен, которым работает текущее окно Claude Code.
+
+    Своё окружение годится только если переменная в нём есть: у statusline и
+    хуков Claude Code её вырезает, поэтому дальше смотрим окружение самого
+    процесса claude - сначала по $CLAUDE_PID, потом по цепочке родителей.
+    Пустая строка означает "окно работает на сессии из Keychain".
+    """
+    own = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
+    if own:
+        return own
+
+    seen, pids = set(), []
+    hint = os.environ.get("CLAUDE_PID")
+    if hint and hint.isdigit():
+        pids.append(int(hint))
+    pid = os.getppid()
+    for _ in range(12):
+        if not pid or pid <= 1 or pid in seen:
+            break
+        seen.add(pid)
+        pids.append(pid)
+        pid = pid_ppid(pid)
+
+    for p in pids:
+        tok = pid_env_var(p, "CLAUDE_CODE_OAUTH_TOKEN")
+        if tok:
+            return tok
+    return ""
+
+
+# Во сколько обходится источник токена: статуслайн зовут каждый ход, и
+# опрашивать менеджер секретов ради подписи аккаунта там нельзя. Сначала
+# дешёвые источники, дорогие - в конце и только если дешёвые не совпали.
+SOURCE_COST = {"token": 0, "env": 0, "file": 1, "credentials": 1,
+               "keychain": 2, "auto": 2, "command": 3}
+WINDOW_MAP_TTL = 3600  # сек, срок кэша соответствия отпечатка и аккаунта
+
+
+def fingerprint(token: str) -> str:
+    """Отпечаток токена: по нему сверяемся, не держа сам токен в файлах."""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()[:16]
+
+
+WINDOW_MAP_MAX = 16  # сколько отпечатков храним, дальше вытесняем старые
+
+
+def read_window_map() -> dict:
+    """
+    Запомненные соответствия "отпечаток токена окна -> имя аккаунта".
+    Записей несколько: на машине одновременно открыты окна на разных токенах,
+    и единственная запись перезатиралась бы при каждом обновлении статуслайна.
+    """
+    try:
+        d = json.loads(WINDOW_MAP_FILE.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    fps = d.get("fps") if isinstance(d, dict) else None
+    if not isinstance(fps, dict):
+        return {}
+    now = time.time()
+    return {fp: rec for fp, rec in fps.items()
+            if isinstance(rec, dict) and now - (rec.get("t") or 0) <= WINDOW_MAP_TTL}
+
+
+def window_map_lookup(fp: str) -> str:
+    rec = read_window_map().get(fp) or {}
+    return rec.get("account") or ""
+
+
+def write_window_map(fp: str, name: str) -> None:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    fps = read_window_map()
+    fps[fp] = {"account": name, "t": time.time()}
+    if len(fps) > WINDOW_MAP_MAX:
+        oldest = sorted(fps.items(), key=lambda kv: kv[1].get("t") or 0)
+        fps = dict(oldest[-WINDOW_MAP_MAX:])
+    try:
+        WINDOW_MAP_FILE.write_text(json.dumps({"fps": fps}))
+    except OSError:
+        pass
+
+
+def session_account() -> tuple:
+    """
+    (аккаунт текущего окна, пояснение). Пояснение непустое, когда окно работает
+    токеном, которого в конфиге нет: цифры тогда не про это окно, и молчать об
+    этом нельзя.
+    """
+    accs = accounts()
+    tok = session_token()
+    if tok:
+        fp = fingerprint(tok)
+        remembered = window_map_lookup(fp)
+        if remembered:
+            for a in accs:
+                if a.name == remembered:
+                    return a, ""
+        for a in sorted(accs, key=lambda x: SOURCE_COST.get(x.source, 3)):
+            if a.access_token() == tok:
+                write_window_map(fp, a.name)
+                return a, ""
+        return None, "токен этого окна в конфиге не описан"
+    for a in accs:
+        if a.source in ("auto", "keychain", "credentials"):
+            return a, ""
+    return None, "окно работает на сессии из Keychain, такого аккаунта в конфиге нет"
+
+
 # --- получение данных --------------------------------------------------------
 
 
@@ -215,7 +623,26 @@ def read_keychain() -> str:
         return ""
 
 
-def read_token() -> dict:
+def read_credentials_file() -> str:
+    """Содержимое ~/.claude/.credentials.json. Пустая строка, если нет."""
+    try:
+        return CREDENTIALS_FILE.read_text()
+    except OSError:
+        return ""
+
+
+def parse_credentials(raw: str, source: str) -> dict:
+    """Сессия Claude Code: {"claudeAiOauth": {...}} -> её содержимое."""
+    if not (raw or "").strip():
+        raise RuntimeError(f"токен не найден ({source}), "
+                           f"выполни /login в Claude Code")
+    try:
+        return json.loads(raw)["claudeAiOauth"]
+    except (json.JSONDecodeError, KeyError, TypeError) as e:
+        raise RuntimeError(f"не разобрал токен из {source}: {e}")
+
+
+def read_token_auto() -> dict:
     """
     OAuth-токен Claude Code. Источники в том же порядке, что у самого
     Claude Code: переменная окружения, Keychain (macOS), файл
@@ -226,20 +653,20 @@ def read_token() -> dict:
         return {"accessToken": env_token, "expiresAt": None}
 
     raw = read_keychain()
-    source = "Keychain"
-    if not raw:
-        try:
-            raw = CREDENTIALS_FILE.read_text()
-            source = str(CREDENTIALS_FILE)
-        except OSError:
-            raise RuntimeError(
-                "токен не найден (ни Keychain, ни "
-                f"{CREDENTIALS_FILE}), выполни /login в Claude Code"
-            )
-    try:
-        return json.loads(raw)["claudeAiOauth"]
-    except (json.JSONDecodeError, KeyError) as e:
-        raise RuntimeError(f"не разобрал токен из {source}: {e}")
+    if raw.strip():
+        return parse_credentials(raw, "Keychain")
+    raw = read_credentials_file()
+    if raw.strip():
+        return parse_credentials(raw, str(CREDENTIALS_FILE))
+    raise RuntimeError(
+        "токен не найден (ни Keychain, ни "
+        f"{CREDENTIALS_FILE}), выполни /login в Claude Code"
+    )
+
+
+def read_token() -> dict:
+    """Токен активного аккаунта."""
+    return active().token()
 
 
 def fetch_usage() -> dict:
@@ -262,6 +689,10 @@ def fetch_usage() -> dict:
     except urllib.error.HTTPError as e:
         body = e.read()[:200].decode("utf-8", "replace")
         if e.code == 401:
+            if expires_at is None:
+                # голый токен (claude setup-token) сам не рефрешится
+                raise RuntimeError("401: токен отвергнут, нужен новый "
+                                   "claude setup-token")
             raise RuntimeError("401: токен отвергнут, запусти claude для refresh")
         if e.code == 429:
             wait = note_rate_limit(e.headers.get("Retry-After"))
@@ -275,7 +706,7 @@ def read_throttle() -> dict:
     """{"until": момент, раньше которого не запрашиваем, "strikes": 429 подряд}"""
     empty = {"until": 0.0, "strikes": 0}
     try:
-        d = json.loads(THROTTLE_FILE.read_text())
+        d = json.loads(active().throttle_file.read_text())
     except (OSError, json.JSONDecodeError):
         return empty
     # до версии с backoff тут лежало голое число - валидный JSON, но не dict
@@ -291,8 +722,8 @@ def read_throttle() -> dict:
 def write_throttle(until: float, strikes: int) -> None:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     try:
-        THROTTLE_FILE.write_text(json.dumps({"until": until,
-                                             "strikes": strikes}))
+        active().throttle_file.write_text(json.dumps({"until": until,
+                                                      "strikes": strikes}))
     except OSError:
         pass
 
@@ -327,23 +758,24 @@ def clear_rate_limit() -> None:
 def load_cache(max_age: float = CACHE_TTL):
     """Возвращает (data, age_sec) или (None, None) если кэша нет/устарел."""
     try:
-        st = CACHE_FILE.stat()
+        st = active().cache_file.stat()
     except OSError:
         return None, None
     age = time.time() - st.st_mtime
     if max_age is not None and age > max_age:
         return None, age
     try:
-        return json.loads(CACHE_FILE.read_text()), age
+        return json.loads(active().cache_file.read_text()), age
     except (json.JSONDecodeError, OSError):
         return None, None
 
 
 def save_cache(data: dict) -> None:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = CACHE_FILE.with_suffix(".tmp")
+    target = active().cache_file
+    tmp = target.with_suffix(".tmp")
     tmp.write_text(json.dumps(data))
-    tmp.replace(CACHE_FILE)
+    tmp.replace(target)
 
 
 def append_history(data: dict) -> None:
@@ -357,13 +789,14 @@ def append_history(data: dict) -> None:
         "d7_reset": reset_of(data, "seven_day"),
     }
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    with HISTORY_FILE.open("a") as f:
+    history = active().history_file
+    with history.open("a") as f:
         f.write(json.dumps(row) + "\n")
     # обрезка, чтобы файл не рос бесконечно
     try:
-        lines = HISTORY_FILE.read_text().splitlines()
+        lines = history.read_text().splitlines()
         if len(lines) > HISTORY_MAX:
-            HISTORY_FILE.write_text("\n".join(lines[-HISTORY_MAX:]) + "\n")
+            history.write_text("\n".join(lines[-HISTORY_MAX:]) + "\n")
     except OSError:
         pass
 
@@ -371,7 +804,7 @@ def append_history(data: dict) -> None:
 def load_history() -> list:
     try:
         rows = []
-        for line in HISTORY_FILE.read_text().splitlines():
+        for line in active().history_file.read_text().splitlines():
             try:
                 rows.append(json.loads(line))
             except json.JSONDecodeError:
@@ -565,21 +998,34 @@ def render_line(label: str, data: dict, key: str, window: float,
     return "  ".join(parts)
 
 
-def render(data: dict, age: float, err: str, width: int = 34) -> str:
+def render(data: dict, age: float, err: str, width: int = 34,
+           label: str = "", current: bool = False, header: bool = True) -> str:
+    """
+    Блок одного аккаунта. При header=False общая шапка не печатается, вместо
+    неё идёт имя аккаунта: так блоки нескольких аккаунтов складываются в один
+    вывод под общей шапкой.
+    """
     on = color_enabled()
     rows = load_history()
     out = []
 
-    stamp = datetime.now().strftime("%H:%M:%S")
-    head = paint("Лимиты Claude Code", C_CYAN + C_BOLD, on)
     agetxt = ""
     if age is not None and age > 5:
         agetxt = "  " + paint(f"(данным {fmt_dur(age)})", age_color(age), on)
-    out.append(f"{head}  {paint(stamp, C_DIM, on)}{agetxt}")
+    if header:
+        stamp = datetime.now().strftime("%H:%M:%S")
+        head = paint("Лимиты Claude Code", C_CYAN + C_BOLD, on)
+        out.append(f"{head}  {paint(stamp, C_DIM, on)}{agetxt}")
+    else:
+        mark = paint("  (это окно)", C_DIM, on) if current else ""
+        out.append(" " + paint(label, C_CYAN + C_BOLD, on) + mark + agetxt)
     note = reserve_note()
     if note:
         out.append(" " + paint(note, C_DIM, on))
-    out.append("")
+    # пустая строка отделяет шапку от строк окон; в блоке аккаунта пробел между
+    # блоками ставит вызывающий, иначе блок распухает
+    if header:
+        out.append("")
 
     if data is None:
         out.append(" " + paint(f"ошибка: {err}", C_RED, on))
@@ -644,7 +1090,13 @@ def reserve_note() -> str:
     return "проценты от бюджета, " + ", ".join(parts) if parts else ""
 
 
-def render_statusline(data: dict, err: str, age: float = None) -> str:
+def render_statusline(data: dict, err: str, age: float = None,
+                      label: str = "", note: str = "") -> str:
+    """
+    label - имя аккаунта текущего окна, печатается последним через ту же
+    вертикальную черту. note непустой, когда окно работает токеном, которого
+    в конфиге нет: тогда цифры не про это окно, и об этом надо сказать прямо.
+    """
     on = color_enabled()
     if data is None:
         return paint("лимиты: n/a", C_DIM, on)
@@ -678,6 +1130,11 @@ def render_statusline(data: dict, err: str, age: float = None) -> str:
         stamp = datetime.fromtimestamp(time.time() - age).strftime("%H:%M")
         bits.append(paint(stamp, age_color(age), on))
 
+    if bits and note:
+        bits.append(paint(f"аккаунт ? {note}", C_YELLOW, on))
+    elif bits and label:
+        bits.append(paint(label, C_DIM, on))
+
     return paint(" | ", C_DIM, on).join(bits) if bits else ""
 
 
@@ -685,39 +1142,104 @@ def render_statusline(data: dict, err: str, age: float = None) -> str:
 
 
 def spawn_background_refresh() -> None:
-    """Асинхронно обновляет кэш, чтобы statusline не блокировался."""
+    """
+    Асинхронно обновляет кэш, чтобы statusline не блокировался. Аккаунт
+    передаём явно: процесс отвязан от сессии, окружение окна ему уже не видно.
+    """
+    cmd = [sys.executable, os.path.abspath(__file__), "--refresh"]
+    acc = active()
+    if not acc.default:
+        cmd += ["--account", acc.name]
     try:
         subprocess.Popen(
-            [sys.executable, os.path.abspath(__file__), "--refresh"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
     except OSError:
         pass
 
 
-def mode_statusline() -> int:
+def use_window_account(forced: Account = None) -> tuple:
+    """
+    Делает активным аккаунт текущего окна и отдаёт (подпись, пояснение).
+
+    При единственном аккаунте по умолчанию ничего не ищем: статуслайн
+    вызывается каждый ход, лишние ps там не нужны, а подписывать нечего.
+    """
+    if forced is not None:
+        use_account(forced)
+        return forced.label, ""
+    accs = accounts()
+    if len(accs) == 1 and accs[0].default:
+        return "", ""
+    acc, note = session_account()
+    if acc is None:
+        # цифры покажем по первому аккаунту, но скажем, что окно работает не им
+        use_account(accs[0])
+        return accs[0].label, note
+    use_account(acc)
+    return acc.label, ""
+
+
+def mode_statusline(forced: Account = None) -> int:
+    label, note = use_window_account(forced)
     cached, age = load_cache()
     if cached is None:
         spawn_background_refresh()
         stale, stale_age = load_cache(max_age=None)
         if stale is None:
-            return 0  # ещё нет данных - молчим, не мусорим в statusline
-        print(render_statusline(stale, None, stale_age), end="")
+            # Без аккаунтов молчим, чтобы не мусорить в пустом статуслайне. А
+            # вот когда аккаунт подписан, пропавший индикатор выглядит как
+            # поломка: пишем, по какому аккаунту ещё нет цифр.
+            if label:
+                print(paint(f"{label}: нет данных", C_DIM, color_enabled()),
+                      end="")
+            return 0
+        print(render_statusline(stale, None, stale_age, label, note), end="")
         return 0
     if age is not None and age > CACHE_TTL * 0.6:
         spawn_background_refresh()
-    print(render_statusline(cached, None, age), end="")
+    print(render_statusline(cached, None, age, label, note), end="")
     return 0
 
 
-def mode_watch(interval: float) -> int:
+def render_accounts(force: bool, width: int = 34, only: list = None) -> tuple:
+    """
+    (текст, все ли аккаунты отдали цифры). Блок на аккаунт под общей шапкой;
+    единственный аккаунт по умолчанию печатается как раньше, без подписей.
+    """
+    accs = only if only else accounts()
+    show_labels = not (len(accs) == 1 and accs[0].default)
+    current = None
+    if show_labels:
+        current, _ = session_account()
+
+    out, ok = [], True
+    if show_labels:
+        on = color_enabled()
+        stamp = datetime.now().strftime("%H:%M:%S")
+        out.append(paint("Лимиты Claude Code", C_CYAN + C_BOLD, on)
+                   + "  " + paint(stamp, C_DIM, on))
+        out.append("")
+    for acc in accs:
+        use_account(acc)
+        data, age, err = get_data(force=force)
+        ok = ok and data is not None
+        if show_labels:
+            out.append(render(data, age, err, width, label=acc.label,
+                              current=(current is acc), header=False))
+            out.append("")
+        else:
+            out.append(render(data, age, err, width))
+    return "\n".join(out).rstrip("\n"), ok
+
+
+def mode_watch(interval: float, only: list = None) -> int:
     sys.stdout.write("\033[?1049h\033[?25l")  # alt-screen, курсор прячем
     sys.stdout.flush()
     try:
         while True:
-            data, age, err = get_data(force=True)
-            frame = render(data, age, err)
+            frame, _ = render_accounts(force=True, only=only)
             sys.stdout.write("\033[H\033[2J" + frame + "\n\n")
             sys.stdout.write(f"\033[2mобновление каждые {int(interval)} сек, "
                              f"Ctrl-C для выхода\033[0m\n")
@@ -737,9 +1259,17 @@ def main() -> int:
         print(__doc__)
         return 0
 
-    # конфиг резерва читаем до всего остального: если он битый, молча считать
-    # от неправильного бюджета нельзя
+    # конфиг читаем до всего остального: если он битый, молча считать от
+    # неправильного бюджета или не того аккаунта нельзя
     try:
+        forced = None
+        if "--account" in args:
+            idx = args.index("--account")
+            if len(args) <= idx + 1:
+                raise RuntimeError("--account без имени аккаунта")
+            forced = account_by_name(args[idx + 1])
+        selected = [forced] if forced else accounts()
+        use_account(selected[0])
         reserves()
     except RuntimeError as e:
         if "--statusline" in args:
@@ -750,15 +1280,42 @@ def main() -> int:
         print(f"ошибка конфигурации: {e}", file=sys.stderr)
         return 1
 
-    if "--refresh" in args:
-        data, _, err = get_data(force=True)
-        if err:
-            print(err, file=sys.stderr)
-            return 1
+    if "--accounts" in args:
+        cur, note = session_account()
+        for acc in accounts():
+            mark = "  <- это окно" if acc is cur else ""
+            print(f"{acc.label}  source={acc.source}{mark}")
+        if note:
+            print(f"окно: {note}", file=sys.stderr)
         return 0
 
+    if "--refresh" in args:
+        rc = 0
+        for acc in selected:
+            use_account(acc)
+            _, _, err = get_data(force=True)
+            if err:
+                prefix = "" if acc.default else f"{acc.label}: "
+                print(prefix + err, file=sys.stderr)
+                rc = 1
+        return rc
+
     if "--json" in args:
-        data, _, err = get_data(force="--cache" not in args)
+        force = "--cache" not in args
+        if "--all" in args:
+            out, rc = {}, 0
+            for acc in accounts():
+                use_account(acc)
+                data, _, err = get_data(force=force)
+                out[acc.label] = data if data is not None else {"error": err}
+                if data is None:
+                    rc = 1
+            print(json.dumps(out, indent=2, ensure_ascii=False))
+            return rc
+        # один аккаунт - форма ответа как была, чтобы не ломать скрипты
+        if forced is None:
+            use_window_account()
+        data, _, err = get_data(force=force)
         if data is None:
             print(json.dumps({"error": err}), file=sys.stderr)
             return 1
@@ -766,7 +1323,7 @@ def main() -> int:
         return 0
 
     if "--statusline" in args:
-        return mode_statusline()
+        return mode_statusline(forced)
 
     if "--watch" in args or "-w" in args:
         flag = "--watch" if "--watch" in args else "-w"
@@ -777,13 +1334,13 @@ def main() -> int:
                 interval = max(MIN_WATCH_INTERVAL, float(args[idx + 1]))
             except ValueError:
                 pass
-        return mode_watch(interval)
+        return mode_watch(interval, only=selected)
 
     # по умолчанию кэш (TTL 120 сек), чтобы частые запуски не ели квоту
     # эндпоинта; --force игнорирует кэш
-    data, age, err = get_data(force="--force" in args)
-    print(render(data, age, err))
-    return 0 if data is not None else 1
+    out, ok = render_accounts(force="--force" in args, only=selected)
+    print(out)
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":
