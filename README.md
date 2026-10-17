@@ -171,6 +171,20 @@ That is not cosmetic: the numbers on such a line belong to a different account,
 and this window's burn shows up nowhere. `cc-limits --accounts` prints which
 accounts are declared and which one the current window uses.
 
+Not every token works for limits. A token from `claude setup-token` - the
+long-lived kind you hand out to machines - comes **without the `user:profile`
+scope**, which this endpoint requires. Worse, the server answers such a token
+with `429` rather than `403`, indistinguishable from a spent request window. So
+on the first `429` `cc-limits` asks `/api/oauth/profile` once and, when the
+scope is missing, says so outright:
+
+```
+... | 19:05 | флот: токен без scope user:profile
+```
+
+and then holds a six-hour pause instead of pointless retries. There is no way
+to get limits for such a token: that needs a `/login` session.
+
 Token sources are probed cheapest first and only until one matches, and the
 match is remembered for an hour in `cache/cc-limits-window.json` keyed by a
 token fingerprint (sha256, first 16 chars; the token itself is not stored).
@@ -322,6 +336,9 @@ denominator is near zero and the ratio means nothing.
   the credentials file.
 - The endpoint is not a documented public API. It can change without notice,
   and this tool will break when it does.
+- A `claude setup-token` token cannot report limits: it lacks the
+  `user:profile` scope. That is the endpoint's rule, not this tool's -
+  inference works with such a token, limit numbers do not.
 - The current window's account is identified by reading the `claude` process
   environment. If Claude Code stops keeping the token there, or `ps` is
   unavailable, the account label disappears while the numbers stay.

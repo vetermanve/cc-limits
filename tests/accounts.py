@@ -96,6 +96,23 @@ check("нет keychain-аккаунта -> предупреждение",
       acc is None and "Keychain" in note, note)
 m.session_token = saved_token
 
+# приговор по scope: читается только для своего отпечатка и живёт у аккаунта
+m.use_account(fleet)
+m.write_scope_verdict(m.fingerprint("tok-флот"), False)
+check("приговор по scope записан у аккаунта", fleet.scope_file.exists(),
+      fleet.scope_file.name)
+check("приговор читается по своему отпечатку",
+      m.read_scope_verdict().get("profile") is False, str(m.read_scope_verdict()))
+m.use_account(lich)
+check("у другого аккаунта приговора нет", m.read_scope_verdict() == {},
+      str(m.read_scope_verdict()))
+m.use_account(fleet)
+m.write_scope_verdict("другой-отпечаток", False)
+check("чужой отпечаток приговор не отдаёт",
+      m.profile_scope_known_missing.__name__ == "profile_scope_known_missing"
+      and m.read_scope_verdict().get("fp") == "другой-отпечаток",
+      str(m.read_scope_verdict()))
+
 # два окна на разных токенах не вытесняют друг друга из карты отпечатков
 m.write_window_map(m.fingerprint("tok-личный"), "личный")
 m.write_window_map(m.fingerprint("tok-флот"), "флот")

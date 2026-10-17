@@ -160,6 +160,31 @@ else
     fail=$((fail + 1)); printf 'ПАДЕНИЕ без конфига статуслайн напечатал: %s\n' "$out"
 fi
 
+# --- токен без scope user:profile: причина вместо обещания повтора
+noscope="$TMP/noscope"; mkdir -p "$noscope/cache"
+cat > "$noscope/cc-limits.json" <<'JSON'
+{"accounts": [{"name": "безскоупа", "source": "token", "token": "tok-без"}]}
+JSON
+python3 -c "
+import json, time, sys
+json.dump({'fp': sys.argv[2], 'profile': False, 't': time.time()},
+          open(sys.argv[1], 'w'))
+" "$noscope/cache/cc-limits-scope-безскоупа.json" \
+  "$(python3 -c "import hashlib;print(hashlib.sha256('tok-без'.encode()).hexdigest()[:16])")"
+python3 -c "
+import json, time, sys
+json.dump({'until': time.time() + 21600, 'strikes': 1}, open(sys.argv[1], 'w'))
+" "$noscope/cache/cc-limits-throttle-безскоупа"
+check "статуслайн называет причину: нет scope" 0 "безскоупа: токен без scope user:profile" \
+    env CLAUDE_CONFIG_DIR="$noscope" CLAUDE_CODE_OAUTH_TOKEN=tok-без \
+    python3 "$CC" --statusline
+out="$(CLAUDE_CONFIG_DIR="$noscope" CLAUDE_CODE_OAUTH_TOKEN=tok-без python3 "$CC" --statusline 2>&1)"
+if printf '%s' "$out" | grep -q "повтор через"; then
+    fail=$((fail + 1)); printf 'ПАДЕНИЕ при отсутствии scope всё ещё обещает повтор\n'
+else
+    pass=$((pass + 1)); printf 'OK   при отсутствии scope повтор не обещается\n'
+fi
+
 # --- дорогой источник токена не должен опрашиваться на каждый ход
 cmdacc="$TMP/cmdacc"
 python3 "$HERE/fixture.py" "$cmdacc" "личный" "секретница" >/dev/null
