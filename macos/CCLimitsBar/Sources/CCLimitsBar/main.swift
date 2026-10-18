@@ -147,9 +147,17 @@ func drawGauge(in rect: CGRect, status: WindowStatus?) {
     let radius = (rect.width - stroke) / 2 - alertInset
     let center = CGPoint(x: rect.midX, y: rect.midY)
 
+    // Цвет кодирует зону, а фон менюбара задаёт пользователь обоями, и любой
+    // фиксированный оттенок где-нибудь да совпадёт с фоном: янтарная дуга на
+    // оранжевых обоях исчезала целиком. Поэтому под цветными элементами
+    // лежит тонкое гало цветом содержимого панели - labelColor белый на
+    // тёмной панели и чёрный на светлой, то есть всегда контрастен фону.
+    let haloWidth = max(0.5, rect.width * 0.03)
+    let haloColor = NSColor.labelColor.withAlphaComponent(0.95)
+
     // butt, а не round: круглый колпачок на 1% рисует заметную точку, то есть
     // показывает больше, чем выработано
-    func arc(from start: CGFloat, sweep: CGFloat, color: NSColor) {
+    func arc(from start: CGFloat, sweep: CGFloat, color: NSColor, halo: Bool = false) {
         guard sweep > 0.5 else { return }
         let path = NSBezierPath()
         if sweep >= 359.5 {
@@ -158,8 +166,13 @@ func drawGauge(in rect: CGRect, status: WindowStatus?) {
             path.appendArc(withCenter: center, radius: radius, startAngle: start,
                            endAngle: start - sweep, clockwise: true)
         }
-        path.lineWidth = stroke
         path.lineCapStyle = .butt
+        if halo {
+            path.lineWidth = stroke + haloWidth * 2
+            haloColor.setStroke()
+            path.stroke()
+        }
+        path.lineWidth = stroke
         color.setStroke()
         path.stroke()
     }
@@ -174,9 +187,9 @@ func drawGauge(in rect: CGRect, status: WindowStatus?) {
     // сегменты встык, без наложения: наложенные полосы одного радиуса
     // смешиваются краями и дают кайму вокруг цвета
     arc(from: 90 - usedDeg, sweep: 360 - usedDeg,
-        color: NSColor.labelColor.withAlphaComponent(0.45))
+        color: NSColor.labelColor.withAlphaComponent(0.35))
     if status?.pct != nil {
-        arc(from: 90, sweep: usedDeg, color: color)
+        arc(from: 90, sweep: usedDeg, color: color, halo: true)
     }
 
     // рывок - отдельный канал: кольцо отвечает "как иду по окну", диск -
@@ -186,9 +199,15 @@ func drawGauge(in rect: CGRect, status: WindowStatus?) {
         let hole = radius - stroke / 2
         let r = hole * 0.94 * CGFloat(min(1.0, max(0.0, burst / 2.0)))
         if r > 0.35 {
+            let disc = NSBezierPath(ovalIn: CGRect(x: center.x - r, y: center.y - r,
+                                                   width: r * 2, height: r * 2))
             colorFor(level: status?.burst_level).setFill()
-            NSBezierPath(ovalIn: CGRect(x: center.x - r, y: center.y - r,
-                                        width: r * 2, height: r * 2)).fill()
+            disc.fill()
+            // тонкая обводка, а не круг побольше: увеличенный круг съедал
+            // дырку кольца и диск расплывался
+            disc.lineWidth = haloWidth
+            haloColor.setStroke()
+            disc.stroke()
         }
     }
 
