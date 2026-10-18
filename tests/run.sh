@@ -141,6 +141,28 @@ check "--diagnose несёт версию контракта" 0 '"contract": 1' 
 check "--version печатает контракт" 0 "контракт 1" \
     env CLAUDE_CONFIG_DIR="$stale" python3 "$CC" --version
 
+# --- пороги зон: их дублирует Swift (macos/.../LimitsMath.swift).
+# Разойдясь, реализации начнут красить одно состояние по-разному, поэтому
+# таблица зафиксирована тут и зеркалится в LimitsMathTests.
+cp "$CC" "$TMP/ccmod.py"
+if PYTHONPATH="$TMP" python3 - <<'PYCHECK'
+import ccmod as m
+assert abs(m.PACE_OVER - 4/3) < 1e-9, m.PACE_OVER
+assert m.PACE_UNDER == 0.5, m.PACE_UNDER
+table = {0.3: "idle", 0.5: "green", 1.0: "green", 1.2: "yellow",
+         1.3333: "yellow", 1.4: "red", None: "gray"}
+for pace, want in table.items():
+    got = m.pace_level(pace)
+    assert got == want, f"pace={pace}: {got}, ждали {want}"
+assert m.pace_of(50, 50) == 1.0
+assert m.pace_of(3, 1.5) is None, "в начале окна темп не считается"
+PYCHECK
+then
+    pass=$((pass + 1)); printf 'OK   пороги зон темпа совпадают с портом в Swift\n'
+else
+    fail=$((fail + 1)); printf 'ПАДЕНИЕ пороги зон темпа разъехались с портом в Swift\n'
+fi
+
 fresh="$TMP/fresh"
 python3 "$HERE/fixture.py" "$fresh" "" >/dev/null
 check "свежие данные не помечаются устаревшими" 0 '"stale": false' \
