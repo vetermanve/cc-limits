@@ -134,6 +134,12 @@ check "причина отказа видна в --diagnose" 0 '"last_error": "O
     env CLAUDE_CONFIG_DIR="$stale" CLAUDE_CODE_OAUTH_TOKEN=tok-один python3 "$CC" --diagnose
 check "код причины машинный, не русская фраза" 0 '"stale_code": "token_expired"' \
     env CLAUDE_CONFIG_DIR="$stale" CLAUDE_CODE_OAUTH_TOKEN=tok-один python3 "$CC" --indicator
+check "--indicator несёт версию контракта" 0 '"contract": 1' \
+    env CLAUDE_CONFIG_DIR="$stale" CLAUDE_CODE_OAUTH_TOKEN=tok-один python3 "$CC" --indicator
+check "--diagnose несёт версию контракта" 0 '"contract": 1' \
+    env CLAUDE_CONFIG_DIR="$stale" CLAUDE_CODE_OAUTH_TOKEN=tok-один python3 "$CC" --diagnose
+check "--version печатает контракт" 0 "контракт 1" \
+    env CLAUDE_CONFIG_DIR="$stale" python3 "$CC" --version
 
 fresh="$TMP/fresh"
 python3 "$HERE/fixture.py" "$fresh" "" >/dev/null

@@ -54,6 +54,7 @@ CC_LIMITS_RESERVE_7D. Тогда все проценты, отклонение �
   cc-limits --diagnose      JSON по аккаунтам для окна настроек: источник,
                             отпечаток токена, scope, возраст кэша, дубли
   cc-limits --check-config ФАЙЛ  проверить конфиг-кандидат и выйти с кодом
+  cc-limits --version       версия машинного контракта (--indicator/--diagnose)
   cc-limits --accounts      какие аккаунты описаны и какой у этого окна
   cc-limits --account ИМЯ   работать только с этим аккаунтом
   cc-limits --refresh       только обновить кэш и выйти (для фона)
@@ -75,6 +76,12 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
+
+# Версия машинного контракта - формы вывода --indicator и --diagnose.
+# Поднимается, когда форма меняется. Внешнему индикатору она нужна, чтобы не
+# гадать по отсутствующим полям: установленный cc-limits бывает старше
+# приложения, и тогда функции молча не работают.
+CONTRACT = 1
 
 API_URL = "https://api.anthropic.com/api/oauth/usage"
 KEYCHAIN_SERVICE = "Claude Code-credentials"
@@ -1551,7 +1558,8 @@ def mode_indicator() -> int:
             "stale_code": stale_code, "windows": windows,
         })
 
-    print(json.dumps({"accounts": out_accounts}, ensure_ascii=False))
+    print(json.dumps({"contract": CONTRACT, "accounts": out_accounts},
+                     ensure_ascii=False))
     return 0
 
 
@@ -1600,6 +1608,7 @@ def mode_diagnose() -> int:
             by_fp.setdefault(fp, []).append(acc.label)
 
     print(json.dumps({
+        "contract": CONTRACT,
         "config": str(CONFIG_FILE),
         "accounts": rows,
         "duplicates": [names for names in by_fp.values() if len(names) > 1],
@@ -1683,6 +1692,10 @@ def main() -> int:
 
     if "--help" in args or "-h" in args:
         print(__doc__)
+        return 0
+
+    if "--version" in args:
+        print(f"cc-limits, контракт {CONTRACT}")
         return 0
 
     # до чтения рабочего конфига: проверяем кандидата, рабочий может быть битым

@@ -58,8 +58,16 @@ struct AccountStatus: Decodable {
 }
 
 struct Snapshot: Decodable {
+    /// версия машинного контракта cc-limits; её нет у версий до введения
+    let contract: Int?
     let accounts: [AccountStatus]
 }
+
+/// Контракт, на который рассчитано это приложение. Поднимать вместе с
+/// CONTRACT в cc-limits, когда меняется форма --indicator: установленный
+/// cc-limits легко оказывается старше приложения, и тогда часть полей просто
+/// не приходит - функции молча не работают, а выглядит это как баг бара.
+let REQUIRED_CONTRACT = 1
 
 let CORE_WINDOWS: [(label: String, key: String)] = [
     (label: "5ч", key: "five_hour"),
@@ -535,6 +543,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func rebuildMenu() {
         let menu = NSMenu()
+        if let snapshot = latest, (snapshot.contract ?? 0) < REQUIRED_CONTRACT {
+            menu.addItem(textItem("   cc-limits устарел, часть данных не придёт",
+                                  size: 12, color: .labelColor, bold: true))
+            menu.addItem(textItem("   обнови его: sh install.sh в репозитории"))
+            menu.addItem(.separator())
+        }
         guard let accs = latest?.accounts, !accs.isEmpty else {
             menu.addItem(textItem("нет данных"))
             appendFooter(menu)

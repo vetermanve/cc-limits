@@ -138,6 +138,7 @@ struct DiagAccount: Decodable {
 }
 
 struct DiagSnapshot: Decodable {
+    let contract: Int?
     let config: String
     let accounts: [DiagAccount]
     let duplicates: [[String]]
@@ -161,6 +162,7 @@ final class ConfigStore: ObservableObject {
     @Published var reserve7: String = ""
     @Published var diag: [String: DiagAccount] = [:]
     @Published var duplicates: [[String]] = []
+    @Published var contract: Int?
     @Published var diagLoading = false
     /// Почему правка ещё не на диске. nil - всё записано.
     @Published private(set) var validation: String?
@@ -217,6 +219,7 @@ final class ConfigStore: ObservableObject {
                 }
                 self.diag = Dictionary(uniqueKeysWithValues: snap.accounts.map { ($0.label, $0) })
                 self.duplicates = snap.duplicates
+                self.contract = snap.contract
             }
         }
     }
@@ -305,6 +308,14 @@ struct AccountsTabView: View {
     var body: some View {
         VStack(spacing: 0) {
             Form {
+                if (store.contract ?? 0) < REQUIRED_CONTRACT {
+                    Section {
+                        Label("Установленный cc-limits старше приложения",
+                              systemImage: "exclamationmark.triangle")
+                    } footer: {
+                        footnote("Часть полей он не отдаёт, поэтому часть настроек молча не работает. Обнови его: sh install.sh в репозитории cc-limits.")
+                    }
+                }
                 if !store.duplicates.isEmpty {
                     Section {
                         ForEach(store.duplicates, id: \.self) { group in

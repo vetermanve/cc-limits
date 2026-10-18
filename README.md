@@ -258,6 +258,7 @@ cc-limits --json --all    # raw API responses for every account
 cc-limits --indicator     # JSON with the computed pace, for external indicators
 cc-limits --diagnose      # JSON per account: source, fingerprint, scope, duplicates
 cc-limits --check-config FILE  # validate a candidate config, exit code 0/1
+cc-limits --version       # version of the machine-readable contract
 cc-limits --accounts      # which accounts are declared, and this window's one
 cc-limits --account флот  # work with this account only
 cc-limits --refresh       # only refresh the cache and exit (for background use)
@@ -272,6 +273,12 @@ to call every half a minute. The second one resolves token sources
 `--check-config` reads the given file with the same code that reads the live
 config. It exists for settings editors: write a candidate to a temp file,
 validate it, and replace the live one only on a zero exit code.
+
+`--indicator` and `--diagnose` carry a `contract` field: the version of their
+output shape. The installed `cc-limits` is easily older than the app calling
+it, and then some fields simply never arrive — features quietly stop working
+and it looks like a bug in the app. The `contract` lets the consumer say so
+out loud. `--version` prints the same number.
 
 `NO_COLOR=1` disables color. `CC_LIMITS_FORCE_COLOR=1` forces it on when stdout
 is not a TTY. `CC_LIMITS_RESERVE_5H` and `CC_LIMITS_RESERVE_7D` set the
