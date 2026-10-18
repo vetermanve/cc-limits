@@ -17,6 +17,7 @@
 // Это кэш-only вызов, в сеть не лезет.
 
 import AppKit
+import CCLimitsCore
 
 // MARK: - Модель (форма JSON из `cc-limits --indicator`)
 
@@ -51,6 +52,8 @@ struct AccountStatus: Decodable {
     let stale: Bool?
     /// почему не обновилось - истёкший токен, пауза после 429 и т.п.
     let stale_reason: String?
+    /// машинный код причины: token_expired, no_scope, rate_limited, other
+    let stale_code: String?
     let windows: [String: WindowStatus]
 }
 
@@ -274,6 +277,133 @@ func textItem(_ text: String, size: CGFloat = 11,
     return item
 }
 
+// MARK: - Автообновление истёкшего токена
+
+/// Claude Code обновляет OAuth-токен только когда сам им пользуется. Если в
+/// Keychain лежит просроченный токен, а claude в этот момент никто не
+/// запускает, обновление лимитов будет падать часами - ровно это и случилось.
+/// Короткий запрос заставляет Claude Code обновить связку.
+///
+/// Запрос тратит бюджет, который этот индикатор и бережёт, поэтому поводов
+/// для него ровно один (код token_expired), повторы редки, а серия неудач
+/// останавливает попытки вместо того, чтобы жечь бюджет в пустоту.
+final class TokenRefresher {
+    private static let timeout: TimeInterval = 120
+    private static let noteLifetime: TimeInterval = 600
+
+    private var inFlight = false
+    /// запрос сделан, ждём следующий снимок: успех определяем по тому, ушла
+    /// ли причина, а не по коду возврата - claude может завершиться нулём,
+    /// не продлив связку
+    private var awaitingVerdict = false
+    private var lastAttempt: Date?
+    private var failures = 0
+    private var noteText: String?
+    private var noteUntil: Date?
+
+    var note: String? {
+        guard let noteText else { return nil }
+        if let until = noteUntil, until < Date() { return nil }
+        return noteText
+    }
+
+    private let binary: String? = {
+        let candidates = [
+            "/opt/homebrew/bin/claude",
+            "/usr/local/bin/claude",
+            NSHomeDirectory() + "/.local/bin/claude",
+            NSHomeDirectory() + "/.claude/local/claude",
+        ]
+        return candidates.first { FileManager.default.isExecutableFile(atPath: $0) }
+    }()
+
+    func refreshIfNeeded(_ snapshot: Snapshot?, enabled: Bool,
+                         completion: @escaping () -> Void) {
+        let expired = snapshot?.accounts.contains {
+            $0.stale == true && $0.stale_code == "token_expired"
+        } ?? false
+
+        func state() -> TokenRefreshPolicy.State {
+            TokenRefreshPolicy.State(
+                expired: expired, enabled: enabled, inFlight: inFlight,
+                awaitingVerdict: awaitingVerdict, failures: failures,
+                lastAttempt: lastAttempt)
+        }
+
+        // состояние пересобираем после приговора: иначе решение о новом
+        // запросе принималось бы по счётчику неудач, снятому до инкремента
+        if let succeeded = TokenRefreshPolicy.verdict(state()) {
+            awaitingVerdict = false
+            if succeeded {
+                failures = 0
+                let f = DateFormatter()
+                f.dateFormat = "HH:mm"
+                say("Вход продлён автоматически в \(f.string(from: Date()))",
+                    lasting: Self.noteLifetime)
+            } else {
+                failures += 1
+                say(failures >= TokenRefreshPolicy.maxFailures
+                    ? "Продлить вход не вышло, запусти claude вручную"
+                    : "Продлить вход не вышло, повтор позже", lasting: nil)
+            }
+        }
+
+        guard TokenRefreshPolicy.shouldLaunch(state()) else { return }
+        guard let binary else {
+            say("claude не найден, вход не продлить", lasting: nil)
+            return
+        }
+
+        inFlight = true
+        lastAttempt = Date()
+        say("Продлеваю вход...", lasting: nil)
+
+        DispatchQueue.global(qos: .utility).async {
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: binary)
+            proc.arguments = ["-p", "ок"]
+            // переменную убираем явно: с ней claude возьмёт токен из
+            // окружения и к связке в Keychain не притронется - то есть не
+            // продлит ровно то, что протухло
+            var env = ProcessInfo.processInfo.environment
+            env.removeValue(forKey: "CLAUDE_CODE_OAUTH_TOKEN")
+            proc.environment = env
+            proc.standardOutput = Pipe()
+            proc.standardError = Pipe()
+
+            var launched = false
+            do {
+                try proc.run()
+                launched = true
+                let deadline = DispatchWorkItem { if proc.isRunning { proc.terminate() } }
+                DispatchQueue.global().asyncAfter(deadline: .now() + Self.timeout,
+                                                  execute: deadline)
+                proc.waitUntilExit()
+                deadline.cancel()
+            } catch {
+                launched = false
+            }
+
+            DispatchQueue.main.async {
+                self.inFlight = false
+                if launched {
+                    // приговор вынесет следующий снимок
+                    self.awaitingVerdict = true
+                } else {
+                    self.failures += 1
+                    self.say("claude не запустился, вход не продлить", lasting: nil)
+                }
+                completion()
+            }
+        }
+    }
+
+    private func say(_ text: String, lasting: TimeInterval?) {
+        noteText = text
+        noteUntil = lasting.map { Date().addingTimeInterval($0) }
+    }
+}
+
 // MARK: - Опрос cc-limits
 
 final class LimitsFetcher {
@@ -325,6 +455,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var latest: Snapshot?
     private var prefs = BarPrefs.load()
     private lazy var settings = SettingsWindowController()
+    private let tokenRefresher = TokenRefresher()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -355,6 +486,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.latest = snapshot
             self.updateIcon()
             self.rebuildMenu()
+            self.tokenRefresher.refreshIfNeeded(
+                snapshot, enabled: self.prefs.autoRefreshToken) { [weak self] in
+                guard let self else { return }
+                self.rebuildMenu()
+                // связка обновилась - просим цифры заново, не дожидаясь такта
+                self.fetcher.refresh { [weak self] in self?.poll() }
+            }
         }
     }
 
@@ -437,6 +575,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     menu.addItem(textItem("   \(reason)"))
                 } else if let age = acc.age, age > 120 {
                     menu.addItem(textItem("   обновлено \(fmtDur(age)) назад"))
+                }
+                if i == 0, let note = tokenRefresher.note {
+                    menu.addItem(textItem("   \(note)"))
                 }
             }
             if i < accs.count - 1 { menu.addItem(.separator()) }

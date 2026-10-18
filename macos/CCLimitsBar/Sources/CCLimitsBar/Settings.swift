@@ -59,6 +59,8 @@ func runCC(_ args: [String]) -> (code: Int32, out: Data, err: Data) {
 struct BarPrefs: Codable {
     var account: String?          // чей кольца на иконке; nil - первый с данными
     var pollInterval: Double = 30
+    /// Сам продлевать протухший вход коротким запросом к claude.
+    var autoRefreshToken: Bool = true
 
     static var path: String { claudeConfigDir + "/cc-limits-bar.json" }
 
@@ -575,6 +577,16 @@ struct IndicatorTabView: View {
                 Text("Запуск")
             } footer: {
                 footnote(autostartNote ?? LaunchAgent.plistPath)
+            }
+
+            Section {
+                Toggle("Продлевать вход самостоятельно", isOn: Binding(
+                    get: { prefs.autoRefreshToken },
+                    set: { prefs.autoRefreshToken = $0; prefs.save() }))
+            } header: {
+                Text("Токен")
+            } footer: {
+                footnote("Claude Code обновляет вход, только когда сам им пользуется. Если вход протух, а claude никто не запускает, цифры замирают. Тогда индикатор сам делает короткий запрос к claude - не чаще раза в десять минут и только при протухшем входе. Запрос тратит немного пятичасового бюджета.")
             }
         }
         .formStyle(.grouped)
