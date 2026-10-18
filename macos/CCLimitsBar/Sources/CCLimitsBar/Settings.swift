@@ -9,6 +9,7 @@
 import AppKit
 import CCLimitsCore
 import Combine
+import ServiceManagement
 import SwiftUI
 
 // MARK: - запуск cc-limits
@@ -86,37 +87,40 @@ extension Notification.Name {
 
 // MARK: - автозапуск
 
-enum LaunchAgent {
-    static let label = "com.cc-limits.bar"
-    static var plistPath: String {
-        NSHomeDirectory() + "/Library/LaunchAgents/\(label).plist"
-    }
-    static var isInstalled: Bool {
-        FileManager.default.fileExists(atPath: plistPath)
-    }
-    /// Запущены ли мы самим launchd: если нет, свежий plist подхватится только
-    /// при следующем входе, и об этом надо сказать прямо, а не делать вид.
-    static var managedByLaunchd: Bool {
-        (ProcessInfo.processInfo.environment["XPC_SERVICE_NAME"] ?? "").contains(label)
+/// Объект входа через SMAppService, а не рукописный plist в LaunchAgents.
+/// Система сама следит за путём к приложению и показывает переключатель в
+/// «Объекты входа»; рукописный агент после переноса .app просто ломался бы,
+/// указывая в никуда.
+enum LoginItem {
+    /// Голый бинарник из swift build бандлом не является, и регистрировать
+    /// системе нечего.
+    static var bundled: Bool { Bundle.main.bundleIdentifier != nil }
+
+    static var enabled: Bool {
+        guard bundled else { return false }
+        return SMAppService.mainApp.status == .enabled
     }
 
-    static func install() throws {
-        let binary = Bundle.main.executablePath ?? CommandLine.arguments[0]
-        let plist: [String: Any] = [
-            "Label": label,
-            "ProgramArguments": [binary],
-            "RunAtLoad": true,
-            "KeepAlive": false,
-        ]
-        let dir = (plistPath as NSString).deletingLastPathComponent
-        try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
-        let data = try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
-        try data.write(to: URL(fileURLWithPath: plistPath), options: .atomic)
+    static var note: String? {
+        guard bundled else {
+            return "Автозапуск доступен только собранному приложению: ./build-app.sh, затем перенеси CCLimitsBar.app в /Applications."
+        }
+        if SMAppService.mainApp.status == .requiresApproval {
+            return "Система ждёт подтверждения в «Основные - Объекты входа»."
+        }
+        return nil
     }
 
-    static func uninstall() throws {
-        if isInstalled {
-            try FileManager.default.removeItem(atPath: plistPath)
+    static func set(_ on: Bool) throws {
+        guard bundled else {
+            throw NSError(domain: "cc-limits.bar", code: 1, userInfo: [
+                NSLocalizedDescriptionKey: "приложение запущено не из бандла",
+            ])
+        }
+        if on {
+            try SMAppService.mainApp.register()
+        } else {
+            try SMAppService.mainApp.unregister()
         }
     }
 }
@@ -543,7 +547,7 @@ struct AccountsTabView: View {
 struct IndicatorTabView: View {
     @ObservedObject var store: ConfigStore
     @State private var prefs = BarPrefs.load()
-    @State private var autostart = LaunchAgent.isInstalled
+    @State private var autostart = LoginItem.enabled
     @State private var autostartNote: String?
 
     var body: some View {
@@ -587,7 +591,8 @@ struct IndicatorTabView: View {
             } header: {
                 Text("Запуск")
             } footer: {
-                footnote(autostartNote ?? LaunchAgent.plistPath)
+                footnote(autostartNote ?? LoginItem.note
+                         ?? "Система запустит индикатор при входе в систему.")
             }
 
             Section {
@@ -605,11 +610,9 @@ struct IndicatorTabView: View {
 
     private func setAutostart(_ on: Bool) {
         do {
-            if on { try LaunchAgent.install() } else { try LaunchAgent.uninstall() }
-            autostart = on
-            autostartNote = on && !LaunchAgent.managedByLaunchd
-                ? "Агент записан, подхватится при следующем входе в систему."
-                : nil
+            try LoginItem.set(on)
+            autostart = LoginItem.enabled
+            autostartNote = nil
         } catch {
             autostartNote = "Не удалось: \(error.localizedDescription)"
         }
