@@ -369,7 +369,18 @@ final class TokenRefresher {
         DispatchQueue.global(qos: .utility).async {
             let proc = Process()
             proc.executableURL = URL(fileURLWithPath: binary)
-            proc.arguments = ["-p", "ок"]
+            // Запрос нужен только ради того, чтобы claude сходил в сеть и
+            // продлил связку, поэтому он максимально дешёвый: самая лёгкая
+            // модель, без MCP-серверов и без записи сессии на диск.
+            proc.arguments = [
+                "-p", "ок",
+                "--model", "haiku",
+                "--strict-mcp-config",
+                "--no-session-persistence",
+            ]
+            // из нейтрального каталога: иначе claude подтянет CLAUDE.md и
+            // память проекта, в котором случайно оказался рабочий каталог бара
+            proc.currentDirectoryURL = URL(fileURLWithPath: NSTemporaryDirectory())
             // переменную убираем явно: с ней claude возьмёт токен из
             // окружения и к связке в Keychain не притронется - то есть не
             // продлит ровно то, что протухло
