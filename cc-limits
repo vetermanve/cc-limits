@@ -99,6 +99,10 @@ WINDOW_MAP_FILE = CACHE_DIR / "cc-limits-window.json"
 # спрашиваем /api/oauth/profile и запоминаем приговор.
 PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
 SCOPE_FILE = CACHE_DIR / "cc-limits-scope.json"
+# Причина последнего неудавшегося обновления. Кэш-only режимы (статуслайн,
+# --indicator) в сеть не ходят и без этого показывали бы устаревшие цифры как
+# свежие: отказ фонового обновления оставался бы невидимым.
+ERROR_FILE = CACHE_DIR / "cc-limits-error.json"
 SCOPE_VERDICT_TTL = 24 * 3600  # сек, срок хранения приговора по scope
 NO_SCOPE_SHORT = "токен без scope, лимиты недоступны"
 NO_SCOPE_FULL = (
@@ -353,11 +357,13 @@ class Account:
             self.history_file = HISTORY_FILE
             self.throttle_file = THROTTLE_FILE
             self.scope_file = SCOPE_FILE
+            self.error_file = ERROR_FILE
         else:
             self.cache_file = CACHE_DIR / f"cc-limits-cache-{self.slug}.json"
             self.history_file = CACHE_DIR / f"cc-limits-history-{self.slug}.jsonl"
             self.throttle_file = CACHE_DIR / f"cc-limits-throttle-{self.slug}"
             self.scope_file = CACHE_DIR / f"cc-limits-scope-{self.slug}.json"
+            self.error_file = CACHE_DIR / f"cc-limits-error-{self.slug}.json"
         self._token = None
 
     @property
@@ -974,6 +980,42 @@ def load_history() -> list:
         return []
 
 
+def write_last_error(message: str) -> None:
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        active().error_file.write_text(json.dumps(
+            {"t": time.time(), "message": message}, ensure_ascii=False))
+    except OSError:
+        pass
+
+
+def clear_last_error() -> None:
+    try:
+        active().error_file.unlink()
+    except OSError:
+        pass
+
+
+def read_last_error() -> dict:
+    """{"t", "message"} последнего отказа или {}, если последняя попытка удалась."""
+    try:
+        d = json.loads(active().error_file.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return d if isinstance(d, dict) and d.get("message") else {}
+
+
+def stale_with(err: str) -> tuple:
+    """
+    Отдаёт устаревший кэш вместе с причиной и запоминает её. Причину надо
+    сохранить: следующий вызов статуслайна или индикатора в сеть не пойдёт и
+    сам уже не узнает, почему цифры старые.
+    """
+    write_last_error(err)
+    stale, age = load_cache(max_age=None)
+    return stale, age, err
+
+
 def get_data(force: bool = False) -> tuple:
     """Возвращает (data, age, err). Берёт из кэша если свежий."""
     if not force:
@@ -989,26 +1031,23 @@ def get_data(force: bool = False) -> tuple:
         try:
             tok = read_token().get("accessToken") or ""
         except RuntimeError as e:
-            stale, age = load_cache(max_age=None)
-            return stale, age, str(e)
+            return stale_with(str(e))
         if verdict.get("fp") == fingerprint(tok):
             if read_throttle()["until"] > time.time():
                 write_throttle(0.0, 0)
-            stale, age = load_cache(max_age=None)
-            return stale, age, NO_SCOPE_FULL
+            return stale_with(NO_SCOPE_FULL)
 
     # сервер ранее ответил 429 - выдерживаем паузу, отдаём кэш
     wait_left = read_throttle()["until"] - time.time()
     if wait_left > 0:
-        stale, age = load_cache(max_age=None)
-        return stale, age, f"лимит запросов, повтор через {fmt_dur(wait_left)}"
+        return stale_with(f"лимит запросов, повтор через {fmt_dur(wait_left)}")
 
     try:
         data = fetch_usage()
     except RuntimeError as e:
-        stale, age = load_cache(max_age=None)
-        return stale, age, str(e)
+        return stale_with(str(e))
     clear_rate_limit()
+    clear_last_error()
     save_cache(data)
     append_history(data)
     return data, 0.0, None
@@ -1465,6 +1504,11 @@ def mode_indicator() -> int:
 
         err = None
         windows = {}
+        # данные старше TTL: фоновое обновление их не обновило, и причина
+        # важнее самих цифр - по устаревшим решать, сколько ещё работать,
+        # опаснее всего
+        stale = age is None or age > CACHE_TTL
+        stale_reason = read_last_error().get("message") if stale else None
         if cached is None:
             verdict = read_scope_verdict()
             if verdict.get("profile") is False:
@@ -1472,7 +1516,7 @@ def mode_indicator() -> int:
             elif wait_left > 0:
                 err = f"лимит запросов, повтор через {fmt_dur(wait_left)}"
             else:
-                err = "нет данных"
+                err = stale_reason or "нет данных"
         else:
             rows = load_history()
             for _, key, window, hist_field, hist_reset, lookback, min_span in CORE_WINDOWS:
@@ -1482,7 +1526,8 @@ def mode_indicator() -> int:
 
         out_accounts.append({
             "label": acc.label, "default": acc.default, "age": age,
-            "error": err, "windows": windows,
+            "error": err, "stale": stale, "stale_reason": stale_reason,
+            "windows": windows,
         })
 
     print(json.dumps({"accounts": out_accounts}, ensure_ascii=False))
@@ -1528,6 +1573,7 @@ def mode_diagnose() -> int:
             "token_error": token_err, "scope_ok": scope_ok,
             "cache_age": age, "reserve": dict(reserves()),
             "throttle_left": max(0.0, wait_left),
+            "last_error": read_last_error().get("message"),
         })
         if fp:
             by_fp.setdefault(fp, []).append(acc.label)

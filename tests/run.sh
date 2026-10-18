@@ -114,6 +114,30 @@ fi
 check "скрытый виден в --diagnose" 0 '"hidden": true' \
     env CLAUDE_CONFIG_DIR="$hidden" CLAUDE_CODE_OAUTH_TOKEN=tok-личный python3 "$CC" --diagnose
 
+# --- устаревшие данные объясняются, а не выдаются за свежие
+stale="$TMP/stale"
+python3 "$HERE/fixture.py" "$stale" "" >/dev/null
+cat > "$stale/cc-limits.json" <<'JSON'
+{"accounts": [{"name": "один", "source": "token", "token": "tok-один"}]}
+JSON
+# кэш и история переезжают под имя аккаунта, затем кэш состаривается
+mv "$stale/cache/cc-limits-cache.json" "$stale/cache/cc-limits-cache-один.json"
+mv "$stale/cache/cc-limits-history.jsonl" "$stale/cache/cc-limits-history-один.jsonl"
+touch -t 202001010000 "$stale/cache/cc-limits-cache-один.json"
+printf '%s' '{"t": 1, "message": "OAuth-токен истёк"}' \
+    > "$stale/cache/cc-limits-error-один.json"
+check "устаревшие данные названы устаревшими" 0 '"stale": true' \
+    env CLAUDE_CONFIG_DIR="$stale" CLAUDE_CODE_OAUTH_TOKEN=tok-один python3 "$CC" --indicator
+check "причина устаревания видна в --indicator" 0 'OAuth-токен истёк' \
+    env CLAUDE_CONFIG_DIR="$stale" CLAUDE_CODE_OAUTH_TOKEN=tok-один python3 "$CC" --indicator
+check "причина отказа видна в --diagnose" 0 '"last_error": "OAuth-токен истёк"' \
+    env CLAUDE_CONFIG_DIR="$stale" CLAUDE_CODE_OAUTH_TOKEN=tok-один python3 "$CC" --diagnose
+
+fresh="$TMP/fresh"
+python3 "$HERE/fixture.py" "$fresh" "" >/dev/null
+check "свежие данные не помечаются устаревшими" 0 '"stale": false' \
+    env CLAUDE_CONFIG_DIR="$fresh" python3 "$CC" --indicator
+
 check "--accounts помечает окно" 0 "это окно" \
     env CLAUDE_CONFIG_DIR="$multi" CLAUDE_CODE_OAUTH_TOKEN=tok-флот python3 "$CC" --accounts
 check "--account выбирает один" 0 "личный" \
