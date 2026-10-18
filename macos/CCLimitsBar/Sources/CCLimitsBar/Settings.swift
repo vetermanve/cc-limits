@@ -131,6 +131,8 @@ struct DiagAccount: Decodable {
     let cache_age: Double?
     let throttle_left: Double?
     let hidden: Bool?
+    /// причина последнего неудавшегося обновления, nil - последняя попытка удалась
+    let last_error: String?
 }
 
 struct DiagSnapshot: Decodable {
@@ -465,6 +467,9 @@ struct AccountsTabView: View {
             lines.append(("Данные получены \(fmtDur(age)) назад", "clock"))
         } else {
             lines.append(("Данных ещё нет", "clock.badge.questionmark"))
+        }
+        if let err = d.last_error, err != d.token_error {
+            lines.append(("Последнее обновление не прошло: \(err)", "arrow.clockwise"))
         }
         if let throttle = d.throttle_left, throttle > 0 {
             lines.append(("Пауза после 429, повтор через \(fmtDur(throttle))", "hourglass"))

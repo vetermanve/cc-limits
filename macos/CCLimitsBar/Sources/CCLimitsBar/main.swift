@@ -47,6 +47,10 @@ struct AccountStatus: Decodable {
     let `default`: Bool
     let age: Double?
     let error: String?
+    /// данные старше TTL: фоновое обновление их не обновило
+    let stale: Bool?
+    /// почему не обновилось - истёкший токен, пауза после 429 и т.п.
+    let stale_reason: String?
     let windows: [String: WindowStatus]
 }
 
@@ -98,7 +102,7 @@ func paceWord(_ st: WindowStatus) -> String {
 
 // MARK: - Иконка статус-бара: два кольца-гейджа (слева 5ч, справа 7д)
 
-func makeIcon(five: WindowStatus?, week: WindowStatus?) -> NSImage {
+func makeIcon(five: WindowStatus?, week: WindowStatus?, stale: Bool = false) -> NSImage {
     // высота под реальную толщину менюбара: на маках с чёлкой она больше
     let height = max(18, NSStatusBar.system.thickness - 2)
     let diameter = height - 5
@@ -110,6 +114,11 @@ func makeIcon(five: WindowStatus?, week: WindowStatus?) -> NSImage {
     // backingScaleFactor экрана (чётко на любом Retina) и под текущую
     // светлую/тёмную тему менюбара
     let image = NSImage(size: NSSize(width: width, height: height), flipped: false) { rect in
+        // устаревшие цифры гасим: по ним нельзя решать, сколько ещё работать,
+        // а нарисованные в полную силу они ничем не отличаются от свежих
+        if stale {
+            NSGraphicsContext.current?.cgContext.setAlpha(0.55)
+        }
         let y = (rect.height - diameter) / 2
         drawGauge(in: CGRect(x: pad, y: y, width: diameter, height: diameter), status: five)
         drawGauge(in: CGRect(x: pad + diameter + gap, y: y, width: diameter, height: diameter), status: week)
@@ -365,7 +374,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let primary = primaryAccount()
         statusItem.button?.image = makeIcon(
             five: primary?.windows["five_hour"],
-            week: primary?.windows["seven_day"]
+            week: primary?.windows["seven_day"],
+            stale: primary?.stale == true
         )
         statusItem.button?.toolTip = tooltipText(primary)
     }
@@ -373,6 +383,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func tooltipText(_ acc: AccountStatus?) -> String {
         guard let acc else { return "cc-limits: нет данных" }
         if let err = acc.error { return "\(acc.label): \(err)" }
+        if acc.stale == true, let reason = acc.stale_reason {
+            return "\(acc.label): данные \(fmtDur(acc.age)) назад\n\(reason)"
+        }
         func part(_ name: String, _ w: WindowStatus?) -> String {
             guard let w, let p = w.pct else { return "\(name) ?" }
             return String(format: "%@ %.0f%% (%@)", name, p, paceWord(w))
@@ -419,7 +432,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         format: "   %@: на этом рывке бюджет кончится за %@ до сброса",
                         w.label, fmtDur((st.remain ?? 0) - (st.eta ?? 0)))))
                 }
-                if let age = acc.age, age > 120 {
+                if acc.stale == true, let reason = acc.stale_reason {
+                    menu.addItem(textItem("   данные \(fmtDur(acc.age)) назад, обновить не вышло:"))
+                    menu.addItem(textItem("   \(reason)"))
+                } else if let age = acc.age, age > 120 {
                     menu.addItem(textItem("   обновлено \(fmtDur(age)) назад"))
                 }
             }
