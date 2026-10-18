@@ -124,7 +124,7 @@ JSON
 mv "$stale/cache/cc-limits-cache.json" "$stale/cache/cc-limits-cache-один.json"
 mv "$stale/cache/cc-limits-history.jsonl" "$stale/cache/cc-limits-history-один.jsonl"
 touch -t 202001010000 "$stale/cache/cc-limits-cache-один.json"
-printf '%s' '{"t": 1, "message": "OAuth-токен истёк"}' \
+printf '%s' '{"t": 1, "message": "OAuth-токен истёк", "code": "token_expired"}' \
     > "$stale/cache/cc-limits-error-один.json"
 check "устаревшие данные названы устаревшими" 0 '"stale": true' \
     env CLAUDE_CONFIG_DIR="$stale" CLAUDE_CODE_OAUTH_TOKEN=tok-один python3 "$CC" --indicator
@@ -132,6 +132,8 @@ check "причина устаревания видна в --indicator" 0 'OAuth
     env CLAUDE_CONFIG_DIR="$stale" CLAUDE_CODE_OAUTH_TOKEN=tok-один python3 "$CC" --indicator
 check "причина отказа видна в --diagnose" 0 '"last_error": "OAuth-токен истёк"' \
     env CLAUDE_CONFIG_DIR="$stale" CLAUDE_CODE_OAUTH_TOKEN=tok-один python3 "$CC" --diagnose
+check "код причины машинный, не русская фраза" 0 '"stale_code": "token_expired"' \
+    env CLAUDE_CONFIG_DIR="$stale" CLAUDE_CODE_OAUTH_TOKEN=tok-один python3 "$CC" --indicator
 
 fresh="$TMP/fresh"
 python3 "$HERE/fixture.py" "$fresh" "" >/dev/null

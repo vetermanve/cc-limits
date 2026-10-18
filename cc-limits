@@ -104,12 +104,29 @@ SCOPE_FILE = CACHE_DIR / "cc-limits-scope.json"
 # свежие: отказ фонового обновления оставался бы невидимым.
 ERROR_FILE = CACHE_DIR / "cc-limits-error.json"
 SCOPE_VERDICT_TTL = 24 * 3600  # сек, срок хранения приговора по scope
+# Коды причин отказа. Внешнему индикатору нужен машинный признак: разбирать
+# русскую фразу он не должен, иначе любая правка формулировки тихо ломает его
+# поведение.
+ERR_TOKEN_EXPIRED = "token_expired"
+ERR_NO_SCOPE = "no_scope"
+ERR_RATE_LIMITED = "rate_limited"
+ERR_OTHER = "other"
+
+TOKEN_EXPIRED_FULL = "OAuth-токен истёк, запусти claude чтобы он обновился"
 NO_SCOPE_SHORT = "токен без scope, лимиты недоступны"
 NO_SCOPE_FULL = (
     "токен без scope user:profile - определение лимитов невозможно. "
     "Этот scope даёт вход через /login, claude setup-token - нет"
 )
 CACHE_TTL = 120  # сек
+
+
+class LimitsError(RuntimeError):
+    """Ошибка с машинным кодом причины, см. ERR_*."""
+
+    def __init__(self, message: str, code: str = ERR_OTHER):
+        super().__init__(message)
+        self.code = code
 # Эндпоинт /api/oauth/usage имеет скользящее окно лимита (~5 мин) и на 429
 # присылает Retry-After. Мы его чтим: THROTTLE_FILE хранит момент, раньше
 # которого запрос не делаем.
@@ -765,10 +782,10 @@ def fetch_usage() -> dict:
         # Токену не хватает scope - ответ эндпоинта предопределён, запрос
         # был бы ритуалом. Приговор живёт сутки, так что перевыпущенный
         # токен проверится заново.
-        raise RuntimeError(NO_SCOPE_FULL)
+        raise LimitsError(NO_SCOPE_FULL, ERR_NO_SCOPE)
     expires_at = tok.get("expiresAt")
     if expires_at and expires_at / 1000 < time.time():
-        raise RuntimeError("OAuth-токен истёк, запусти claude чтобы он обновился")
+        raise LimitsError(TOKEN_EXPIRED_FULL, ERR_TOKEN_EXPIRED)
     req = urllib.request.Request(
         API_URL,
         headers={
@@ -980,11 +997,12 @@ def load_history() -> list:
         return []
 
 
-def write_last_error(message: str) -> None:
+def write_last_error(message: str, code: str = ERR_OTHER) -> None:
     try:
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
         active().error_file.write_text(json.dumps(
-            {"t": time.time(), "message": message}, ensure_ascii=False))
+            {"t": time.time(), "message": message, "code": code},
+            ensure_ascii=False))
     except OSError:
         pass
 
@@ -1005,13 +1023,13 @@ def read_last_error() -> dict:
     return d if isinstance(d, dict) and d.get("message") else {}
 
 
-def stale_with(err: str) -> tuple:
+def stale_with(err: str, code: str = ERR_OTHER) -> tuple:
     """
     Отдаёт устаревший кэш вместе с причиной и запоминает её. Причину надо
     сохранить: следующий вызов статуслайна или индикатора в сеть не пойдёт и
     сам уже не узнает, почему цифры старые.
     """
-    write_last_error(err)
+    write_last_error(err, code)
     stale, age = load_cache(max_age=None)
     return stale, age, err
 
@@ -1031,21 +1049,22 @@ def get_data(force: bool = False) -> tuple:
         try:
             tok = read_token().get("accessToken") or ""
         except RuntimeError as e:
-            return stale_with(str(e))
+            return stale_with(str(e), getattr(e, "code", ERR_OTHER))
         if verdict.get("fp") == fingerprint(tok):
             if read_throttle()["until"] > time.time():
                 write_throttle(0.0, 0)
-            return stale_with(NO_SCOPE_FULL)
+            return stale_with(NO_SCOPE_FULL, ERR_NO_SCOPE)
 
     # сервер ранее ответил 429 - выдерживаем паузу, отдаём кэш
     wait_left = read_throttle()["until"] - time.time()
     if wait_left > 0:
-        return stale_with(f"лимит запросов, повтор через {fmt_dur(wait_left)}")
+        return stale_with(f"лимит запросов, повтор через {fmt_dur(wait_left)}",
+                          ERR_RATE_LIMITED)
 
     try:
         data = fetch_usage()
     except RuntimeError as e:
-        return stale_with(str(e))
+        return stale_with(str(e), getattr(e, "code", ERR_OTHER))
     clear_rate_limit()
     clear_last_error()
     save_cache(data)
@@ -1508,7 +1527,9 @@ def mode_indicator() -> int:
         # важнее самих цифр - по устаревшим решать, сколько ещё работать,
         # опаснее всего
         stale = age is None or age > CACHE_TTL
-        stale_reason = read_last_error().get("message") if stale else None
+        last = read_last_error() if stale else {}
+        stale_reason = last.get("message")
+        stale_code = last.get("code")
         if cached is None:
             verdict = read_scope_verdict()
             if verdict.get("profile") is False:
@@ -1527,7 +1548,7 @@ def mode_indicator() -> int:
         out_accounts.append({
             "label": acc.label, "default": acc.default, "age": age,
             "error": err, "stale": stale, "stale_reason": stale_reason,
-            "windows": windows,
+            "stale_code": stale_code, "windows": windows,
         })
 
     print(json.dumps({"accounts": out_accounts}, ensure_ascii=False))
