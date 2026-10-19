@@ -1209,7 +1209,7 @@ def window_status(data: dict, key: str, window: float, rows: list,
         "eta": None, "running_out": False, "level": "gray",
         "pace": None, "avg_rate": None, "projected_pct": None, "dry": 0.0,
         "in_reserve": False, "burst_pace": None, "burst_level": "gray",
-        "burst_projected_pct": None,
+        "burst_projected_pct": None, "dry_sec": 0.0,
     }
     if pct is None:
         return status
@@ -1243,6 +1243,11 @@ def window_status(data: dict, key: str, window: float, rows: list,
         # при сохранении темпа к сбросу придёшь ровно в pace * 100% бюджета
         projected_pct=(pace * 100.0 if pace is not None else None),
         dry=(1.0 - 1.0 / pace if pace and pace > 1.0 else 0.0),
+        # сколько окна просидишь без лимитов, если держать накопленный темп.
+        # Для недели это и есть главный ответ: рывок последних суток,
+        # растянутый на оставшиеся пять, предсказывает хуже, чем вся
+        # прошедшая неделя
+        dry_sec=((1.0 - 1.0 / pace) * window if pace and pace > 1.0 else 0.0),
         # бюджет выбран, но окно ещё живо: дальше идёт чужая доля
         in_reserve=(pct >= 100 and reserve > 0),
         level=pace_level(pace),

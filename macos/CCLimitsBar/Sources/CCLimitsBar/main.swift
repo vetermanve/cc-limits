@@ -41,6 +41,8 @@ struct WindowStatus: Decodable {
     let burst_pace: Double?
     let burst_level: String?
     let burst_projected_pct: Double?
+    /// сколько окна просидишь без лимитов при накопленном темпе
+    let dry_sec: Double?
 }
 
 struct AccountStatus: Decodable {
@@ -608,11 +610,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     menu.addItem(textItem("   бюджет 7д выбран, дальше идёт резерв",
                                           color: .systemRed))
                 }
+                // Какой прогноз показывать, зависит от длины окна. Пять
+                // часов решает рывок: окно короткое, важно то, что делаешь
+                // прямо сейчас. Неделю решает накопленный темп - рывок
+                // последних суток, растянутый на оставшиеся пять, предсказывает
+                // хуже, чем вся уже прошедшая неделя.
                 for w in CORE_WINDOWS {
-                    guard let st = acc.windows[w.key], st.running_out == true else { continue }
-                    menu.addItem(textItem(String(
-                        format: "   %@: на этом рывке бюджет кончится за %@ до сброса",
-                        w.label, fmtDur((st.remain ?? 0) - (st.eta ?? 0)))))
+                    guard let st = acc.windows[w.key] else { continue }
+                    if w.key == "five_hour" {
+                        guard st.running_out == true else { continue }
+                        menu.addItem(textItem(String(
+                            format: "   %@: на этом рывке бюджет кончится за %@ до сброса",
+                            w.label, fmtDur((st.remain ?? 0) - (st.eta ?? 0)))))
+                    } else {
+                        guard let dry = st.dry_sec, dry > 0 else { continue }
+                        menu.addItem(textItem(String(
+                            format: "   %@: при этом темпе бюджет кончится за %@ до сброса",
+                            w.label, fmtDur(dry))))
+                    }
                 }
                 if acc.stale == true, let reason = acc.stale_reason {
                     menu.addItem(textItem("   данные \(fmtDur(acc.age)) назад, обновить не вышло:"))

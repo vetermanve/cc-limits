@@ -168,6 +168,42 @@ python3 "$HERE/fixture.py" "$fresh" "" >/dev/null
 check "свежие данные не помечаются устаревшими" 0 '"stale": false' \
     env CLAUDE_CONFIG_DIR="$fresh" python3 "$CC" --indicator
 
+# --- нехватка по накопленному темпу: для недели это и есть главный прогноз
+over="$TMP/over"; mkdir -p "$over/cache"
+python3 - "$over" <<'PYGEN'
+import json, sys, time, datetime, pathlib
+root = pathlib.Path(sys.argv[1])
+now = time.time()
+# прошли сутки недельного окна, съедено 50%: темп вчетверо выше равномерного
+r7 = datetime.datetime.fromtimestamp(now + 6 * 86400, datetime.timezone.utc)
+r5 = datetime.datetime.fromtimestamp(now + 3600, datetime.timezone.utc)
+(root / "cache" / "cc-limits-cache.json").write_text(json.dumps({
+    "five_hour": {"utilization": 10, "resets_at": r5.isoformat()},
+    "seven_day": {"utilization": 50, "resets_at": r7.isoformat()},
+    "limits": [], "seven_day_breakdown": {"rows": []},
+    "extra_usage": {"is_enabled": False},
+}))
+PYGEN
+env CLAUDE_CONFIG_DIR="$over" python3 "$CC" --indicator > "$over/out.json" 2>/dev/null
+# вывод кладём в файл: с конвейером heredoc перебивает stdin, и python
+# получает скрипт вместо данных
+python3 - "$over/out.json" <<'PYCHECK'
+import json, sys
+w = json.load(open(sys.argv[1]))["accounts"][0]["windows"]["seven_day"]
+pace, dry_sec = w["pace"], w["dry_sec"]
+assert pace > 3, f"ожидали заметный перерасход, получили {pace}"
+expected = (1 - 1 / pace) * 7 * 24 * 3600
+assert abs(dry_sec - expected) < 60, f"{dry_sec} != {expected}"
+assert dry_sec > 4 * 86400, f"при таком темпе без лимитов больше четырёх суток, а не {dry_sec}"
+PYCHECK
+if [ $? -eq 0 ]; then
+    pass=$((pass + 1)); printf 'OK   нехватка по накопленному темпу считается\n'
+else
+    fail=$((fail + 1)); printf 'ПАДЕНИЕ нехватка по накопленному темпу\n'
+fi
+check "в темпе нехватки нет" 0 '"dry_sec": 0.0' \
+    env CLAUDE_CONFIG_DIR="$fresh" python3 "$CC" --indicator
+
 check "--accounts помечает окно" 0 "это окно" \
     env CLAUDE_CONFIG_DIR="$multi" CLAUDE_CODE_OAUTH_TOKEN=tok-флот python3 "$CC" --accounts
 check "--account выбирает один" 0 "личный" \
